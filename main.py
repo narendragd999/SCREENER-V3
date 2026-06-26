@@ -252,6 +252,14 @@ DEFAULT_CONFIG = {
     # stocks that the user wants to track. Read by ema9_router._run_screen_pipeline
     # and ema9_router.ema9_quick_scan via _load_prime_fv_gap_pct_from_config().
     "ema9_prime_fv_gap_pct":       0.0,
+    # ── Chartink Live Feed Master Toggle ──────────────────────────────────────
+    # When False, the Chartink auto-polling scheduler does NOT start on server
+    # boot, the /api/chartink-screener/scan-now endpoint rejects requests, the
+    # frontend stops its 5-min polling timer, AND send_telegram() is suppressed
+    # (secondary kill-switch alongside the Options toggle). This gives the user
+    # a single "quiet time" switch for everything Chartink-related. Persisted
+    # in config.json so it survives server restarts.
+    "chartink_feed_enabled":       True,
 }
 
 def load_config() -> Dict:
@@ -305,7 +313,7 @@ save_fundamentals  = lambda d: _wj(FUNDAMENTALS_CACHE_FILE, d)
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
 def send_telegram(token: str, chat_id: str, text: str):
-    # ── Hard kill-switch: never send Telegram when options processing is OFF ──
+    # ── Hard kill-switch #1: never send Telegram when options processing is OFF ──
     # The Options Processing toggle is the user's "leave me alone" switch.
     # When it's off, the user explicitly does NOT want alerts — because the
     # alerts would be missing option-ladder data anyway (fetch_option_chain
@@ -314,12 +322,25 @@ def send_telegram(token: str, chat_id: str, text: str):
     # automatically silenced. This is the final backstop.
     try:
         if not is_options_processing_enabled():
-            print("[Telegram] SUPPRESSED — options processing is disabled (kill-switch active)")
+            print("[Telegram] SUPPRESSED — options processing is disabled (kill-switch #1)")
             return
     except Exception:
         # If is_options_processing_enabled() somehow isn't defined yet (e.g.,
         # during early module import), fall through and send normally —
         # we'd rather over-alert than crash the scheduler thread.
+        pass
+
+    # ── Hard kill-switch #2: never send Telegram when Chartink feed is OFF ──
+    # The Chartink Live Feed toggle is the user's second "quiet time" switch.
+    # When Chartink is off, the user has signaled they don't want active
+    # monitoring right now — so we suppress ALL Telegram alerts, not just
+    # Chartink-derived ones. This gives the user two independent ways to
+    # silence alerts: Options OFF OR Chartink OFF = no Telegram.
+    try:
+        if not is_chartink_feed_enabled():
+            print("[Telegram] SUPPRESSED — Chartink Live Feed is disabled (kill-switch #2)")
+            return
+    except Exception:
         pass
 
     if not token or not chat_id:
@@ -514,6 +535,33 @@ def _refresh_options_enabled_from_config() -> bool:
 def is_options_processing_enabled() -> bool:
     """Public accessor for other modules / endpoints."""
     return _OPTIONS_ENABLED
+
+
+# ─── Chartink Live Feed Master Switch ──────────────────────────────────────
+# In-memory mirror of cfg["chartink_feed_enabled"]. Read on:
+#   • Server startup — to decide whether to call start_chartink_scheduler()
+#   • send_telegram() — secondary kill-switch (Chartink OFF → no Telegram)
+#   • /api/chartink-feed/toggle — to report current state
+# Toggled via PUT /api/chartink-feed/toggle which updates config.json AND
+# this flag immediately (no server restart needed). When toggled OFF at
+# runtime, we also try to call stop_chartink_scheduler() if the watcher
+# module exposes one — otherwise the scheduler keeps running but the
+# frontend stops polling and the results are ignored.
+_CHARTINK_FEED_ENABLED: bool = True
+
+def _refresh_chartink_feed_enabled_from_config() -> bool:
+    """Reload the in-memory Chartink flag from disk config. Returns the new value."""
+    global _CHARTINK_FEED_ENABLED
+    try:
+        _CHARTINK_FEED_ENABLED = bool(load_config().get("chartink_feed_enabled", True))
+    except Exception:
+        _CHARTINK_FEED_ENABLED = True
+    return _CHARTINK_FEED_ENABLED
+
+def is_chartink_feed_enabled() -> bool:
+    """Public accessor — used by send_telegram() and the toggle endpoints."""
+    return _CHARTINK_FEED_ENABLED
+
 
 def fetch_option_chain(ticker: str) -> Tuple[Optional[Dict], Optional[str]]:
     # ── KILL-SWITCH: short-circuit NSE calls when user has disabled options ──
@@ -2390,6 +2438,10 @@ class ConfigUpdate(BaseModel):
     # ── Prime Target FV Gap Tolerance (relaxes undervalued-only filter) ──
     # 0.0 = strict (cp < fv); 10.0 = allow up to 10% overvalued.
     ema9_prime_fv_gap_pct:            Optional[float] = None
+    # ── Chartink Live Feed master toggle ──
+    # When False: no auto-polling, no scan-now, frontend stops polling,
+    # AND Telegram alerts are suppressed (secondary kill-switch).
+    chartink_feed_enabled:            Optional[bool]  = None
 
 class SpecificScreenRequest(BaseModel):
     tickers: List[str]
@@ -2418,6 +2470,7 @@ async def get_status():
         "scan_interval":        cfg["auto_scan_interval_min"],
         "last_scan":            log[-1]["time"] if log else None,
         "options_processing":   cfg.get("options_processing_enabled", True),
+        "chartink_feed":        cfg.get("chartink_feed_enabled", True),
     }
 
 @app.get("/api/config")
@@ -2435,6 +2488,10 @@ async def update_config(data: ConfigUpdate):
     if "options_processing_enabled" in updates:
         _refresh_options_enabled_from_config()
         print(f"[CONFIG] options_processing_enabled -> {_OPTIONS_ENABLED}")
+    # ── Keep the Chartink feed toggle in sync too.
+    if "chartink_feed_enabled" in updates:
+        _refresh_chartink_feed_enabled_from_config()
+        print(f"[CONFIG] chartink_feed_enabled -> {_CHARTINK_FEED_ENABLED}")
     if cfg["auto_scan_enabled"]:
         start_scheduler(cfg)
     return cfg
@@ -2489,6 +2546,93 @@ async def set_options_toggle(req: OptionsToggleRequest):
                       else "All NSE option-chain calls are short-circuited; "
                            "Chartink Live Feed + yfinance will get full HTTP pool."),
     }
+
+
+# ─────────────────────────────────────────────────────────────
+#  CHARTINK LIVE FEED TOGGLE  (master switch for Chartink polling + alerts)
+# ─────────────────────────────────────────────────────────────
+# When disabled:
+#   • start_chartink_scheduler() is NOT called on server boot
+#   • PUT endpoint tries to call stop_chartink_scheduler() at runtime (if the
+#     watcher module exposes one) to halt the already-running scheduler
+#   • send_telegram() is suppressed (kill-switch #2 above)
+#   • Frontend stops its 5-min polling timer + disables the "Scan Now" button
+# Toggle is persisted in config.json so it survives server restarts.
+
+class ChartinkFeedToggleRequest(BaseModel):
+    enabled: Optional[bool] = None
+
+# Try to import stop_chartink_scheduler from chartink_watcher — if the module
+# exposes it, we can halt the scheduler at runtime without a server restart.
+# If it doesn't, we set the flag and the frontend stops polling, but the
+# backend scheduler keeps running harmlessly (its cached results are just
+# ignored until the user restarts the server or toggles back ON).
+try:
+    from chartink_watcher import stop_chartink_scheduler as _stop_chartink_scheduler_fn
+    _HAS_CHARTINK_STOP_FN = True
+    print("[STARTUP] chartink_watcher.stop_chartink_scheduler() imported — runtime stop available")
+except ImportError:
+    _stop_chartink_scheduler_fn = None
+    _HAS_CHARTINK_STOP_FN = False
+    print("[STARTUP] chartink_watcher.stop_chartink_scheduler() not found — "
+          "runtime stop will use flag-only mode (restart server to fully halt scheduler)")
+
+@app.get("/api/chartink-feed/toggle")
+async def get_chartink_feed_toggle():
+    """Return current Chartink Live Feed state + what's affected."""
+    return {
+        "enabled":            is_chartink_feed_enabled(),
+        "cached_in_memory":   _CHARTINK_FEED_ENABLED,
+        "runtime_stop_available": _HAS_CHARTINK_STOP_FN,
+        "note":               "When disabled: no auto-polling, no Scan Now, "
+                              "frontend stops polling, AND Telegram alerts are suppressed.",
+        "affected_endpoints": [
+            "POST /api/chartink-screener/scan-now",
+            "GET /api/chartink-screener/results (frontend polling stops)",
+            "scheduler: chartink auto-poll every 5 min",
+            "send_telegram() — secondary kill-switch",
+        ],
+    }
+
+@app.put("/api/chartink-feed/toggle")
+async def set_chartink_feed_toggle(req: ChartinkFeedToggleRequest):
+    """Flip the Chartink Live Feed master switch. Persists to config.json."""
+    if req.enabled is None:
+        raise HTTPException(400, "Field 'enabled' (bool) is required")
+    cfg = load_config()
+    cfg["chartink_feed_enabled"] = bool(req.enabled)
+    save_config(cfg)
+    # Update in-memory flag IMMEDIATELY
+    _refresh_chartink_feed_enabled_from_config()
+    state = "ENABLED" if _CHARTINK_FEED_ENABLED else "DISABLED"
+    print(f"[CHARTINK] Live Feed master switch -> {state}")
+
+    # If toggling OFF at runtime, try to stop the scheduler.
+    # If toggling ON at runtime, try to (re)start it.
+    action_msg = ""
+    if not _CHARTINK_FEED_ENABLED:
+        if _HAS_CHARTINK_STOP_FN:
+            try:
+                _stop_chartink_scheduler_fn()
+                action_msg = "Scheduler stopped at runtime."
+            except Exception as e:
+                action_msg = f"Scheduler stop failed ({e}) — flag set, restart server to fully halt."
+        else:
+            action_msg = "Flag set. Frontend will stop polling. Restart server to fully halt the backend scheduler."
+    else:
+        # Toggling ON — try to (re)start the scheduler
+        try:
+            start_chartink_scheduler()
+            action_msg = "Scheduler started at runtime."
+        except Exception as e:
+            action_msg = f"Scheduler start failed ({e}) — flag set, restart server to activate."
+
+    return {
+        "ok":      True,
+        "enabled": _CHARTINK_FEED_ENABLED,
+        "message": f"Chartink Live Feed is now {state}. {action_msg}",
+    }
+
 
 @app.get("/api/tickers")
 async def get_tickers():
@@ -3746,9 +3890,20 @@ async def startup_event():
     _refresh_options_enabled_from_config()
     print(f"[STARTUP] Options processing = {'ENABLED' if _OPTIONS_ENABLED else 'DISABLED'} "
           f"(loaded from config.json)")
+    # ── Hydrate the Chartink feed toggle from disk on boot ──────────────────
+    _refresh_chartink_feed_enabled_from_config()
+    print(f"[STARTUP] Chartink Live Feed = {'ENABLED' if _CHARTINK_FEED_ENABLED else 'DISABLED'} "
+          f"(loaded from config.json)")
     if cfg.get("auto_scan_enabled"):
         start_scheduler(cfg)
-    start_chartink_scheduler()   # auto-poll Chartink every 5 min
+    # ── Only start the Chartink auto-poller if the toggle is ON ─────────────
+    # When OFF, the scheduler doesn't start; the user can toggle it back ON
+    # via the header switch (PUT /api/chartink-feed/toggle) which calls
+    # start_chartink_scheduler() at runtime.
+    if _CHARTINK_FEED_ENABLED:
+        start_chartink_scheduler()   # auto-poll Chartink every 5 min
+    else:
+        print("[STARTUP] Chartink scheduler NOT started (toggle is OFF)")
 
 if __name__ == "__main__":
     import uvicorn

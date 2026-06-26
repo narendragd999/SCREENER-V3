@@ -752,13 +752,13 @@
       "lr_slope_pct": -0.3535,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 30.3,
-      "fv_error": null,
-      "composite_fair_price": 492.28,
-      "fv_model_count": 2,
-      "valuation_bucket": "UNDERVALUED",
       "fair_gap_pct": 30.3,
-      "composite_gain_pct": 30.3
+      "fv_error": null,
+      "composite_gain_pct": 30.3,
+      "valuation_bucket": "UNDERVALUED",
+      "gap_to_fair_pct": 30.3,
+      "composite_fair_price": 492.28,
+      "fv_model_count": 2
     },
     "LODHA": {
       "ticker": "LODHA",
@@ -1511,13 +1511,13 @@
       "lr_slope_pct": 0.2508,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 12.65,
-      "fv_error": null,
-      "composite_fair_price": 1067.31,
-      "fv_model_count": 1,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 12.65,
-      "composite_gain_pct": 12.65
+      "fv_error": null,
+      "composite_gain_pct": 12.65,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 12.65,
+      "composite_fair_price": 1067.31,
+      "fv_model_count": 1
     },
     "JSWENERGY": {
       "ticker": "JSWENERGY",
@@ -2270,13 +2270,13 @@
       "lr_slope_pct": 0.2209,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 11.1,
-      "fv_error": null,
-      "composite_fair_price": 637.14,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 11.1,
-      "composite_gain_pct": 11.1
+      "fv_error": null,
+      "composite_gain_pct": 11.1,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 11.1,
+      "composite_fair_price": 637.14,
+      "fv_model_count": 3
     },
     "ICICIGI": {
       "ticker": "ICICIGI",
@@ -3029,13 +3029,13 @@
       "lr_slope_pct": 0.0204,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 3.48,
-      "fv_error": null,
-      "composite_fair_price": 1876.76,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 3.49,
-      "composite_gain_pct": 3.49
+      "fv_error": null,
+      "composite_gain_pct": 3.49,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 3.48,
+      "composite_fair_price": 1876.76,
+      "fv_model_count": 3
     },
     "ALKEM": {
       "ticker": "ALKEM",
@@ -3788,13 +3788,13 @@
       "lr_slope_pct": -0.0206,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 5.48,
-      "fv_error": null,
-      "composite_fair_price": 5722.39,
-      "fv_model_count": 2,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 5.48,
-      "composite_gain_pct": 5.48
+      "fv_error": null,
+      "composite_gain_pct": 5.48,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 5.48,
+      "composite_fair_price": 5722.39,
+      "fv_model_count": 2
     },
     "DMART": {
       "ticker": "DMART",
@@ -4547,13 +4547,13 @@
       "lr_slope_pct": -0.1613,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 17.25,
-      "fv_error": null,
-      "composite_fair_price": 5035.26,
-      "fv_model_count": 2,
-      "valuation_bucket": "UNDERVALUED",
       "fair_gap_pct": 17.25,
-      "composite_gain_pct": 17.25
+      "fv_error": null,
+      "composite_gain_pct": 17.25,
+      "valuation_bucket": "UNDERVALUED",
+      "gap_to_fair_pct": 17.25,
+      "composite_fair_price": 5035.26,
+      "fv_model_count": 2
     },
     "CHOLAFIN": {
       "ticker": "CHOLAFIN",
@@ -5306,13 +5306,13 @@
       "lr_slope_pct": 0.1476,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 1.99,
-      "fv_error": null,
-      "composite_fair_price": 1834.99,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 1.99,
-      "composite_gain_pct": 1.99
+      "fv_error": null,
+      "composite_gain_pct": 1.99,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 1.99,
+      "composite_fair_price": 1834.99,
+      "fv_model_count": 3
     },
     "HDFCBANK": {
       "ticker": "HDFCBANK",
@@ -6065,13 +6065,13 @@
       "lr_slope_pct": -0.0373,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 9.12,
-      "fv_error": null,
-      "composite_fair_price": 868.89,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 9.12,
-      "composite_gain_pct": 9.12
+      "fv_error": null,
+      "composite_gain_pct": 9.12,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 9.12,
+      "composite_fair_price": 868.89,
+      "fv_model_count": 3
     },
     "M&M": {
       "ticker": "M&M",
@@ -6824,13 +6824,13 @@
       "lr_slope_pct": -0.0608,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 12.43,
-      "fv_error": null,
-      "composite_fair_price": 3577.87,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 12.43,
-      "composite_gain_pct": 12.43
+      "fv_error": null,
+      "composite_gain_pct": 12.43,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 12.43,
+      "composite_fair_price": 3577.87,
+      "fv_model_count": 3
     },
     "PRESTIGE": {
       "ticker": "PRESTIGE",
@@ -7583,13 +7583,13 @@
       "lr_slope_pct": 0.2172,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 4.67,
-      "fv_error": null,
-      "composite_fair_price": 1628.98,
-      "fv_model_count": 2,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 4.67,
-      "composite_gain_pct": 4.67
+      "fv_error": null,
+      "composite_gain_pct": 4.67,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 4.67,
+      "composite_fair_price": 1628.98,
+      "fv_model_count": 2
     },
     "SHREECEM": {
       "ticker": "SHREECEM",
@@ -8342,13 +8342,13 @@
       "lr_slope_pct": 0.0349,
       "above_50sma": true,
       "above_200sma": false,
-      "gap_to_fair_pct": 9.64,
-      "fv_error": null,
-      "composite_fair_price": 28215.52,
-      "fv_model_count": 2,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 9.64,
-      "composite_gain_pct": 9.64
+      "fv_error": null,
+      "composite_gain_pct": 9.64,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 9.64,
+      "composite_fair_price": 28215.52,
+      "fv_model_count": 2
     },
     "TIINDIA": {
       "ticker": "TIINDIA",
@@ -9101,13 +9101,13 @@
       "lr_slope_pct": 0.3061,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 15.42,
-      "fv_error": null,
-      "composite_fair_price": 3525.07,
-      "fv_model_count": 2,
-      "valuation_bucket": "UNDERVALUED",
       "fair_gap_pct": 15.42,
-      "composite_gain_pct": 15.42
+      "fv_error": null,
+      "composite_gain_pct": 15.42,
+      "valuation_bucket": "UNDERVALUED",
+      "gap_to_fair_pct": 15.42,
+      "composite_fair_price": 3525.07,
+      "fv_model_count": 2
     },
     "TITAN": {
       "ticker": "TITAN",
@@ -9860,13 +9860,13 @@
       "lr_slope_pct": -0.0826,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 10.38,
-      "fv_error": null,
-      "composite_fair_price": 4736.87,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 10.38,
-      "composite_gain_pct": 10.38
+      "fv_error": null,
+      "composite_gain_pct": 10.38,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 10.38,
+      "composite_fair_price": 4736.87,
+      "fv_model_count": 3
     },
     "LUPIN": {
       "ticker": "LUPIN",
@@ -10619,13 +10619,13 @@
       "lr_slope_pct": -0.0154,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": 4.03,
-      "fv_error": null,
-      "composite_fair_price": 2437.85,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": 4.02,
-      "composite_gain_pct": 4.02
+      "fv_error": null,
+      "composite_gain_pct": 4.02,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": 4.03,
+      "composite_fair_price": 2437.85,
+      "fv_model_count": 3
     },
     "AUBANK": {
       "ticker": "AUBANK",
@@ -11378,13 +11378,13 @@
       "lr_slope_pct": 0.0841,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": -7.2,
-      "fv_error": null,
-      "composite_fair_price": 959.43,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": -7.2,
-      "composite_gain_pct": -7.2
+      "fv_error": null,
+      "composite_gain_pct": -7.2,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": -7.2,
+      "composite_fair_price": 959.43,
+      "fv_model_count": 3
     },
     "INDUSINDBK": {
       "ticker": "INDUSINDBK",
@@ -12137,13 +12137,13 @@
       "lr_slope_pct": 0.2097,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": -8.23,
-      "fv_error": null,
-      "composite_fair_price": 843.35,
-      "fv_model_count": 2,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": -8.22,
-      "composite_gain_pct": -8.22
+      "fv_error": null,
+      "composite_gain_pct": -8.22,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": -8.23,
+      "composite_fair_price": 843.35,
+      "fv_model_count": 2
     },
     "PHOENIXLTD": {
       "ticker": "PHOENIXLTD",
@@ -12896,13 +12896,13 @@
       "lr_slope_pct": 0.1602,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": -1.16,
-      "fv_error": null,
-      "composite_fair_price": 1882.44,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": -1.16,
-      "composite_gain_pct": -1.16
+      "fv_error": null,
+      "composite_gain_pct": -1.16,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": -1.16,
+      "composite_fair_price": 1882.44,
+      "fv_model_count": 3
     },
     "POLYCAB": {
       "ticker": "POLYCAB",
@@ -13655,13 +13655,13 @@
       "lr_slope_pct": 0.5476,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": -2.87,
-      "fv_error": null,
-      "composite_fair_price": 9257.78,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": -2.86,
-      "composite_gain_pct": -2.86
+      "fv_error": null,
+      "composite_gain_pct": -2.86,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": -2.87,
+      "composite_fair_price": 9257.78,
+      "fv_model_count": 3
     },
     "RADICO": {
       "ticker": "RADICO",
@@ -14414,13 +14414,13 @@
       "lr_slope_pct": 0.4472,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": -3.65,
-      "fv_error": null,
-      "composite_fair_price": 3690.09,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": -3.65,
-      "composite_gain_pct": -3.65
+      "fv_error": null,
+      "composite_gain_pct": -3.65,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": -3.65,
+      "composite_fair_price": 3690.09,
+      "fv_model_count": 3
     },
     "GRASIM": {
       "ticker": "GRASIM",
@@ -15173,13 +15173,13 @@
       "lr_slope_pct": 0.3363,
       "above_50sma": true,
       "above_200sma": true,
-      "gap_to_fair_pct": -8.12,
-      "fv_error": null,
-      "composite_fair_price": 2872.68,
-      "fv_model_count": 3,
-      "valuation_bucket": "FAIR",
       "fair_gap_pct": -8.12,
-      "composite_gain_pct": -8.12
+      "fv_error": null,
+      "composite_gain_pct": -8.12,
+      "valuation_bucket": "FAIR",
+      "gap_to_fair_pct": -8.12,
+      "composite_fair_price": 2872.68,
+      "fv_model_count": 3
     }
   }
 }

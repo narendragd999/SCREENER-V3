@@ -393,6 +393,38 @@ When ON: normal behavior — NSE calls + Telegram alerts fire as usual.">
                        bg-slate-800 text-slate-500 border border-border/50">…</span>
         </span>
       </label>
+      <!-- ── CHARTINK LIVE FEED TOGGLE (master switch for Chartink + alerts) ── -->
+      <!-- When OFF: backend stops the Chartink auto-polling scheduler, the
+           /api/chartink-screener/scan-now endpoint rejects requests, frontend
+           stops its 5-min polling timer, AND send_telegram() is suppressed
+           (secondary kill-switch alongside Options). Either toggle OFF = no
+           Telegram alerts. -->
+      <label class="flex items-center gap-2 cursor-pointer select-none"
+             title="Chartink Live Feed master switch.
+
+When OFF:
+  • Chartink auto-polling scheduler STOPS (no 5-min background scans).
+  • 'Scan Now' button is disabled (no manual scans either).
+  • Frontend stops its 5-min polling timer.
+  • ALL Telegram alerts are SUPPRESSED (secondary kill-switch).
+  • Either Options OFF OR Chartink OFF = no Telegram notifications.
+
+When ON: normal behavior — Chartink polls every 5 min + Telegram alerts fire as usual.">
+        <div class="relative">
+          <input type="checkbox" id="chartinkFeedToggle" class="sr-only peer"
+                 onchange="onChartinkFeedToggleChange()">
+          <div class="w-10 h-5 bg-card2 border border-border/50 rounded-full peer
+                      peer-checked:bg-accent2/20 peer-checked:border-accent2/40 transition-all"></div>
+          <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-slate-500 rounded-full transition-all
+                      peer-checked:translate-x-5 peer-checked:bg-accent2"></div>
+        </div>
+        <span class="font-ui text-xs text-slate-300 whitespace-nowrap">
+          Chartink
+          <span id="chartinkFeedBadge"
+                class="ml-1 font-mono text-[10px] px-1.5 py-0.5 rounded-full
+                       bg-slate-800 text-slate-500 border border-border/50">…</span>
+        </span>
+      </label>
       <span id="clock"></span>
     </div>
   </div>
@@ -2506,6 +2538,138 @@ async function onOptionsToggleChange() {
     _renderOptionsToggleUI(!newState);
     if (typeof setChartinkStatus === 'function') {
       setChartinkStatus(`Failed to toggle options: ${err.message}`, 'danger');
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CHARTINK LIVE FEED TOGGLE  (master switch — mirrors Options toggle)
+//  • On page load: GET /api/chartink-feed/toggle to sync checkbox with backend
+//  • On change: PUT /api/chartink-feed/toggle to flip the backend master switch
+//  • Persists across server restarts (stored in config.json)
+//  • When OFF:
+//      – Backend stops the Chartink auto-polling scheduler (if stop_chartink_scheduler is available)
+//      – Frontend stops its 5-min fetchChartinkResults() polling timer
+//      – 'Scan Now' button is disabled
+//      – send_telegram() is suppressed (secondary kill-switch alongside Options)
+//  • Either Options OFF OR Chartink OFF = no Telegram alerts.
+// ═══════════════════════════════════════════════════════════
+let _chartinkFeedEnabled = null;  // null = not yet loaded
+
+async function loadChartinkFeedToggleState() {
+  try {
+    const resp = await fetch('/api/chartink-feed/toggle');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data  = await resp.json();
+    _chartinkFeedEnabled = !!data.enabled;
+    _renderChartinkFeedToggleUI(_chartinkFeedEnabled);
+    // Apply the state to the Chartink polling + Scan Now button
+    _applyChartinkFeedState(_chartinkFeedEnabled);
+  } catch (err) {
+    console.warn('[ChartinkFeedToggle] Failed to load state:', err);
+    _chartinkFeedEnabled = null;
+    const badge = document.getElementById('chartinkFeedBadge');
+    const cb    = document.getElementById('chartinkFeedToggle');
+    if (badge) {
+      badge.textContent = 'ERR';
+      badge.className   = 'ml-1 font-mono text-[10px] px-1.5 py-0.5 rounded-full ' +
+                          'bg-danger/20 text-danger border border-danger/40';
+    }
+    if (cb) cb.disabled = true;
+  }
+}
+
+function _renderChartinkFeedToggleUI(enabled) {
+  const cb    = document.getElementById('chartinkFeedToggle');
+  const badge = document.getElementById('chartinkFeedBadge');
+  if (!cb || !badge) return;
+  cb.checked = !!enabled;
+  cb.disabled = false;
+  if (enabled) {
+    badge.textContent = 'ON';
+    badge.className   = 'ml-1 font-mono text-[10px] px-1.5 py-0.5 rounded-full ' +
+                        'bg-accent2/15 text-accent2 border border-accent2/40';
+  } else {
+    badge.textContent = 'OFF';
+    badge.className   = 'ml-1 font-mono text-[10px] px-1.5 py-0.5 rounded-full ' +
+                        'bg-danger/15 text-danger border border-danger/40';
+  }
+}
+
+/**
+ * Apply the Chartink feed state to the frontend:
+ * - When OFF: stop the polling timer + countdown, disable the Scan Now button.
+ * - When ON: restart the polling timer (if we're on the Chartink tab) + enable Scan Now.
+ * This mirrors startChartinkPolling() / stopChartinkPolling() patterns.
+ */
+function _applyChartinkFeedState(enabled) {
+  const scanNowBtn = document.getElementById('chartinkScanNowBtn');
+  if (enabled) {
+    // (Re)start polling if it was previously stopped by this toggle
+    // startChartinkPolling() is idempotent — it checks _chartinkPollStarted
+    if (typeof startChartinkPolling === 'function' && !_chartinkPollStarted) {
+      startChartinkPolling();
+    }
+    if (scanNowBtn) {
+      scanNowBtn.disabled = false;
+      scanNowBtn.classList.remove('opacity-40', 'cursor-not-allowed');
+      scanNowBtn.title = '';
+    }
+  } else {
+    // Stop the polling timer + countdown
+    if (_chartinkPollTimer) { clearInterval(_chartinkPollTimer); _chartinkPollTimer = null; }
+    if (_chartinkCountdownTimer) { clearInterval(_chartinkCountdownTimer); _chartinkCountdownTimer = null; }
+    _chartinkPollStarted = false;  // allow startChartinkPolling() to restart later
+    // Disable Scan Now
+    if (scanNowBtn) {
+      scanNowBtn.disabled = true;
+      scanNowBtn.classList.add('opacity-40', 'cursor-not-allowed');
+      scanNowBtn.title = 'Chartink Live Feed is disabled. Toggle it back ON via the header switch.';
+    }
+    // Update the countdown display
+    const nextScanEl = document.getElementById('chartinkNextScan');
+    if (nextScanEl) nextScanEl.textContent = 'OFF';
+    const statusEl = document.getElementById('chartinkStatusText');
+    if (statusEl) {
+      statusEl.textContent = 'Live Feed DISABLED — toggle ON via header switch';
+      statusEl.className = 'font-mono text-xs text-danger';
+    }
+  }
+}
+
+async function onChartinkFeedToggleChange() {
+  const cb = document.getElementById('chartinkFeedToggle');
+  if (!cb) return;
+  const newState = cb.checked;
+  // Optimistic UI update
+  _renderChartinkFeedToggleUI(newState);
+  _applyChartinkFeedState(newState);
+  try {
+    const resp = await fetch('/api/chartink-feed/toggle', {
+      method:  'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ enabled: newState }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    _chartinkFeedEnabled = !!data.enabled;
+    _renderChartinkFeedToggleUI(_chartinkFeedEnabled);
+    _applyChartinkFeedState(_chartinkFeedEnabled);
+    console.log(`[ChartinkFeedToggle] ${data.message}`);
+    if (typeof setChartinkStatus === 'function') {
+      setChartinkStatus(
+        _chartinkFeedEnabled
+          ? 'Chartink Live Feed ENABLED — polling + Telegram alerts resume.'
+          : 'Chartink Live Feed DISABLED — polling stopped, Telegram SUPPRESSED.',
+        _chartinkFeedEnabled ? 'success' : 'info'
+      );
+    }
+  } catch (err) {
+    console.error('[ChartinkFeedToggle] Failed to update:', err);
+    _renderChartinkFeedToggleUI(!newState);
+    _applyChartinkFeedState(!newState);
+    if (typeof setChartinkStatus === 'function') {
+      setChartinkStatus(`Failed to toggle Chartink feed: ${err.message}`, 'danger');
     }
   }
 }
@@ -7260,6 +7424,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // in config.json (so a server restart still respects the user's last choice).
   if (typeof loadOptionsToggleState === 'function') {
     loadOptionsToggleState();
+  }
+
+  // ── Load Chartink Live Feed toggle state from backend on boot ──
+  // Mirrors the Options toggle: syncs the header checkbox with config.json,
+  // and applies the state to the Chartink polling timer + Scan Now button.
+  if (typeof loadChartinkFeedToggleState === 'function') {
+    loadChartinkFeedToggleState();
   }
 
   // ── Load Prime FV Gap threshold from backend config on boot ──
