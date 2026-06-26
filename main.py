@@ -46,7 +46,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -83,6 +83,14 @@ SCAN_LOG_FILE  = "scan_log.json"
 TRACKER_FILE        = "strike_tracker.json"
 PREMIUM_ZONE_FILE   = "premium_zone.json"
 PNL_TRACKER_FILE    = "pnl_tracker.json"
+# Paper-trading log for Chartink Prime Target stocks. Each trade records
+# entry/exit prices, dates, target %, days held, and P&L. Survives server
+# restarts because it's a plain JSON file written via _wj (atomic write).
+TRADE_LOG_FILE      = "trade_log.json"
+# Fundamental filter cache (Piotroski-lite 5-check score per ticker).
+# Refreshed on-demand via the Fundamentals tab → "Refresh Now" button.
+# Stores one entry per ticker with raw yfinance metrics + computed score.
+FUNDAMENTALS_CACHE_FILE = "fundamentals_cache.json"
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -229,6 +237,21 @@ DEFAULT_CONFIG = {
     "lifetime_high_filter_enabled": False,
     "lifetime_high_lookback_days":  252,   # ~1 trading year
     "lifetime_high_buffer_pct":     1.0,   # skip if price >= 52w_high * (1 - buffer%)
+    # ── Options Processing Master Toggle ──────────────────────────────────────
+    # When False, fetch_option_chain() short-circuits immediately and returns
+    # (None, "options_disabled_by_user") without hitting NSE. The auto-scheduler
+    # still runs every N minutes, but the entire NSE option-chain path is
+    # skipped, freeing up the GIL + HTTP pool for Chartink Live Feed and
+    # yfinance downloads. This is the kill-switch the user requested.
+    "options_processing_enabled":  True,
+    # ── Prime Target FV Gap Tolerance ─────────────────────────────────────────
+    # How much overvaluation (in %) is tolerated when classifying a ticker as a
+    # Prime Target. 0.0 = strict undervalued only (current_price < fair_value).
+    # 10.0 = allow tickers up to 10% overvalued (gap_to_fair_pct >= -10) to
+    # still be classified as Prime, capturing slightly-overvalued uptrending
+    # stocks that the user wants to track. Read by ema9_router._run_screen_pipeline
+    # and ema9_router.ema9_quick_scan via _load_prime_fv_gap_pct_from_config().
+    "ema9_prime_fv_gap_pct":       0.0,
 }
 
 def load_config() -> Dict:
@@ -268,11 +291,37 @@ load_premium_zone  = lambda: _rj(PREMIUM_ZONE_FILE, [])
 save_premium_zone  = lambda d: _wj(PREMIUM_ZONE_FILE, d)
 load_pnl_tracker   = lambda: _rj(PNL_TRACKER_FILE, [])
 save_pnl_tracker   = lambda d: _wj(PNL_TRACKER_FILE, d)
+# Trade Log persistence (paper-trading journal for Chartink Prime targets).
+# Stored as { "trades": [ {...}, ... ] } so we can attach metadata later
+# (e.g., schema version, last_updated) without breaking existing reads.
+load_trade_log     = lambda: _rj(TRADE_LOG_FILE, {"trades": []})
+save_trade_log     = lambda d: _wj(TRADE_LOG_FILE, d)
+# Fundamentals cache: { "last_run_at": "...", "total": N, "results": [...] }
+# Each result has: sr_no, security, symbol, metrics{...}, score, verdict, checks[]
+load_fundamentals  = lambda: _rj(FUNDAMENTALS_CACHE_FILE, {"results": []})
+save_fundamentals  = lambda d: _wj(FUNDAMENTALS_CACHE_FILE, d)
 
 # ─────────────────────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────
 def send_telegram(token: str, chat_id: str, text: str):
+    # ── Hard kill-switch: never send Telegram when options processing is OFF ──
+    # The Options Processing toggle is the user's "leave me alone" switch.
+    # When it's off, the user explicitly does NOT want alerts — because the
+    # alerts would be missing option-ladder data anyway (fetch_option_chain
+    # is short-circuited). We check the toggle HERE, at the lowest level,
+    # so that any future code path that calls send_telegram() is also
+    # automatically silenced. This is the final backstop.
+    try:
+        if not is_options_processing_enabled():
+            print("[Telegram] SUPPRESSED — options processing is disabled (kill-switch active)")
+            return
+    except Exception:
+        # If is_options_processing_enabled() somehow isn't defined yet (e.g.,
+        # during early module import), fall through and send normally —
+        # we'd rather over-alert than crash the scheduler thread.
+        pass
+
     if not token or not chat_id:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -446,7 +495,36 @@ def reset_nse_session():
 # ─────────────────────────────────────────────────────────────
 #  NSE OPTION CHAIN
 # ─────────────────────────────────────────────────────────────
+
+# ─── Options Processing Master Switch ──────────────────────────────────────
+# In-memory mirror of cfg["options_processing_enabled"]. Read on EVERY call to
+# fetch_option_chain() so the toggle takes effect immediately when flipped via
+# /api/options/toggle — no scheduler restart needed.
+_OPTIONS_ENABLED: bool = True
+
+def _refresh_options_enabled_from_config() -> bool:
+    """Reload the in-memory flag from disk config. Returns the new value."""
+    global _OPTIONS_ENABLED
+    try:
+        _OPTIONS_ENABLED = bool(load_config().get("options_processing_enabled", True))
+    except Exception:
+        _OPTIONS_ENABLED = True
+    return _OPTIONS_ENABLED
+
+def is_options_processing_enabled() -> bool:
+    """Public accessor for other modules / endpoints."""
+    return _OPTIONS_ENABLED
+
 def fetch_option_chain(ticker: str) -> Tuple[Optional[Dict], Optional[str]]:
+    # ── KILL-SWITCH: short-circuit NSE calls when user has disabled options ──
+    # This is the single chokepoint through which EVERY options-fetching path
+    # flows (find_best_strike, check_proximity_alerts, _do_refresh_ladders,
+    # scan_premium_zone_job). When disabled, all of them return None instantly
+    # with zero network I/O, freeing the scheduler thread + HTTP pool for
+    # Chartink Live Feed + yfinance downloads.
+    if not _OPTIONS_ENABLED:
+        return None, "options_disabled_by_user"
+
     session = get_nse_session()
     if session is None:
         return None, None
@@ -1580,6 +1658,21 @@ def check_proximity_alerts(signals: List[Dict], cfg: Dict) -> List[Dict]:
                   f"Rs{proximity_ceiling:.2f}  dist={dist_pct:.2f}%  ✅ in sell zone")
 
         if in_sell_zone:
+            # ── OPTIONS PROCESSING KILL-SWITCH ───────────────────────────────
+            # When the user has disabled options processing via the header
+            # toggle, we skip the ENTIRE sell-zone alert path — no option
+            # ladder fetch, no hit dict, no save, and MOST IMPORTANTLY no
+            # Telegram send. Without this guard, send_telegram() below would
+            # still fire every time a Gate-2-confirmed signal entered the sell
+            # zone, even though fetch_option_chain() was short-circuited.
+            # The user explicitly reported this bug: "even though I added the
+            # Options Toggle UI, telegram alerts keep throwing."
+            if not is_options_processing_enabled():
+                print(f"[PROXIMITY] {ticker} SKIP — options processing disabled by user "
+                      f"(no alert, no Telegram, no NSE call)")
+                time.sleep(random.uniform(0.1, 0.3))
+                continue
+
             g2_date = sig.get("Sell_Zone_EMA_Confirm_Date", "?")
 
             # ── Option ladder with CE gain% to spot the hottest strike ──────
@@ -1723,30 +1816,42 @@ def check_proximity_alerts(signals: List[Dict], cfg: Dict) -> List[Dict]:
                 else:
                     hot_line = f"🌡 Hottest OTM: Rs{hot_strike:.0f} CE  LTP Rs{hot_ltp}"
 
-            send_telegram(
-                cfg["telegram_bot_token"],
-                cfg["telegram_chat_id"],
-                f"*SELL ZONE — {ticker}* ✅ All 3 Gates Passed\n"
-                f"Gate 1 ✅ Momentum break (close < prev low)\n"
-                f"Gate 2 ✅ EMA breach confirmed {g2_date}\n"
-                f"Gate 3 ✅ "
-                + (
-                    f"Price Rs{cur_price:.2f} BROKE ABOVE Surge High Rs{proximity_ceiling:.2f} "
-                    f"(+{abs(dist_pct):.2f}% above resistance) 🚨 RETEST IN PROGRESS\n"
-                    if above_surge else
-                    f"Price Rs{cur_price:.2f} within {dist_pct:.2f}% of Surge High "
-                    f"Rs{proximity_ceiling:.2f} (limit {proximity_pct}%)\n"
-                ) +
-                f"Strike Rs{sig.get('Suggested_Strike','?')} CE  "
-                f"Expiry {sig.get('Expiry','?')}\n"
-                f"Surge Gain: {sig.get('Surge_Gain_Pct','?')}% "
-                f"({'High-based ✅' if sig.get('Surge_Gain_Used_High') else 'Close-based (wick filtered)'})\n"
-                f"BCS: SELL Rs{sig.get('Suggested_Strike','?')} / "
-                f"BUY Rs{sig.get('BCS_Hedge_Strike','?')}  "
-                f"Net Premium Rs{sig.get('BCS_Net_Premium','?')}\n"
-                f"{surge_block}"
-                f"{hot_line}"
-            )
+            # ── DEFENSE-IN-DEPTH: never fire Telegram when options are disabled ──
+            # The top-of-block guard above (line ~1636) should already have
+            # skipped us via `continue`, so we should never reach here with
+            # options disabled. But this second guard guarantees that NO
+            # Telegram message can ever leave the server when the user has
+            # turned options OFF — regardless of future code refactors that
+            # might add new early-return paths or restructure the sell-zone
+            # block. Belt and suspenders.
+            if not is_options_processing_enabled():
+                print(f"[PROXIMITY] {ticker} in sell zone but options disabled — "
+                      f"Telegram SUPPRESSED (defense-in-depth guard)")
+            else:
+                send_telegram(
+                    cfg["telegram_bot_token"],
+                    cfg["telegram_chat_id"],
+                    f"*SELL ZONE — {ticker}* ✅ All 3 Gates Passed\n"
+                    f"Gate 1 ✅ Momentum break (close < prev low)\n"
+                    f"Gate 2 ✅ EMA breach confirmed {g2_date}\n"
+                    f"Gate 3 ✅ "
+                    + (
+                        f"Price Rs{cur_price:.2f} BROKE ABOVE Surge High Rs{proximity_ceiling:.2f} "
+                        f"(+{abs(dist_pct):.2f}% above resistance) 🚨 RETEST IN PROGRESS\n"
+                        if above_surge else
+                        f"Price Rs{cur_price:.2f} within {dist_pct:.2f}% of Surge High "
+                        f"Rs{proximity_ceiling:.2f} (limit {proximity_pct}%)\n"
+                    ) +
+                    f"Strike Rs{sig.get('Suggested_Strike','?')} CE  "
+                    f"Expiry {sig.get('Expiry','?')}\n"
+                    f"Surge Gain: {sig.get('Surge_Gain_Pct','?')}% "
+                    f"({'High-based ✅' if sig.get('Surge_Gain_Used_High') else 'Close-based (wick filtered)'})\n"
+                    f"BCS: SELL Rs{sig.get('Suggested_Strike','?')} / "
+                    f"BUY Rs{sig.get('BCS_Hedge_Strike','?')}  "
+                    f"Net Premium Rs{sig.get('BCS_Net_Premium','?')}\n"
+                    f"{surge_block}"
+                    f"{hot_line}"
+                )
 
         time.sleep(random.uniform(0.2, 0.5))
 
@@ -2230,7 +2335,7 @@ async def ema9_screener_page():
 async def ema9_screener_page():
     return FileResponse(BASE_DIR / "static" / "ema9_backtest.html")
 
-app.include_router(oc_router)
+#app.include_router(oc_router)
 app.include_router(sma_router)
 
 app.include_router(bt_router)
@@ -2280,6 +2385,11 @@ class ConfigUpdate(BaseModel):
     lifetime_high_filter_enabled:     Optional[bool]  = None
     lifetime_high_lookback_days:      Optional[int]   = None
     lifetime_high_buffer_pct:         Optional[float] = None
+    # ── Options processing master toggle (kill-switch for NSE calls) ──
+    options_processing_enabled:       Optional[bool]  = None
+    # ── Prime Target FV Gap Tolerance (relaxes undervalued-only filter) ──
+    # 0.0 = strict (cp < fv); 10.0 = allow up to 10% overvalued.
+    ema9_prime_fv_gap_pct:            Optional[float] = None
 
 class SpecificScreenRequest(BaseModel):
     tickers: List[str]
@@ -2299,14 +2409,15 @@ async def get_status():
     prox = load_proximity()
     log  = load_scan_log()
     return {
-        "market_open":      is_market_open(),
-        "ist_time":         datetime.now(IST).strftime("%H:%M:%S"),
-        "ist_date":         datetime.now(IST).strftime("%Y-%m-%d"),
-        "active_signals":   len(sigs),
-        "proximity_alerts": len(prox),
-        "auto_scan":        cfg["auto_scan_enabled"],
-        "scan_interval":    cfg["auto_scan_interval_min"],
-        "last_scan":        log[-1]["time"] if log else None,
+        "market_open":          is_market_open(),
+        "ist_time":             datetime.now(IST).strftime("%H:%M:%S"),
+        "ist_date":             datetime.now(IST).strftime("%Y-%m-%d"),
+        "active_signals":       len(sigs),
+        "proximity_alerts":     len(prox),
+        "auto_scan":            cfg["auto_scan_enabled"],
+        "scan_interval":        cfg["auto_scan_interval_min"],
+        "last_scan":            log[-1]["time"] if log else None,
+        "options_processing":   cfg.get("options_processing_enabled", True),
     }
 
 @app.get("/api/config")
@@ -2319,9 +2430,65 @@ async def update_config(data: ConfigUpdate):
     updates = {k: v for k, v in data.dict().items() if v is not None}
     cfg.update(updates)
     save_config(cfg)
+    # ── Keep the in-memory options toggle in sync if the caller updated it via
+    # the general /api/config endpoint (rather than the dedicated toggle).
+    if "options_processing_enabled" in updates:
+        _refresh_options_enabled_from_config()
+        print(f"[CONFIG] options_processing_enabled -> {_OPTIONS_ENABLED}")
     if cfg["auto_scan_enabled"]:
         start_scheduler(cfg)
     return cfg
+
+# ─────────────────────────────────────────────────────────────
+#  OPTIONS PROCESSING TOGGLE  (kill-switch for NSE option-chain calls)
+# ─────────────────────────────────────────────────────────────
+# When disabled, fetch_option_chain() returns (None, "options_disabled_by_user")
+# immediately — no NSE HTTP traffic. The auto-scheduler still runs but every
+# options-fetching path (find_best_strike, check_proximity_alerts,
+# _do_refresh_ladders, scan_premium_zone_job) becomes a no-op. This frees the
+# scheduler thread + requests session pool for Chartink Live Feed and
+# yfinance downloads. Toggle is persisted in config.json so it survives restarts.
+
+class OptionsToggleRequest(BaseModel):
+    enabled: Optional[bool] = None
+
+@app.get("/api/options/toggle")
+async def get_options_toggle():
+    """Return current options-processing state + how many callers would be affected."""
+    return {
+        "enabled":             is_options_processing_enabled(),
+        "cached_in_memory":    _OPTIONS_ENABLED,
+        "note":                "When disabled, all NSE option-chain calls short-circuit immediately.",
+        "affected_endpoints":  [
+            "POST /api/screen/all",
+            "POST /api/screen/specific",
+            "POST /api/proximity/check",
+            "POST /api/proximity/refresh-ladders",
+            "POST /api/premium-zone/scan",
+            "scheduler.job() (auto-scan every N min)",
+        ],
+    }
+
+@app.put("/api/options/toggle")
+async def set_options_toggle(req: OptionsToggleRequest):
+    """Flip the options-processing master switch. Persists to config.json."""
+    if req.enabled is None:
+        raise HTTPException(400, "Field 'enabled' (bool) is required")
+    cfg = load_config()
+    cfg["options_processing_enabled"] = bool(req.enabled)
+    save_config(cfg)
+    # Update in-memory flag IMMEDIATELY — no FastAPI restart needed.
+    _refresh_options_enabled_from_config()
+    state = "ENABLED" if _OPTIONS_ENABLED else "DISABLED"
+    print(f"[OPTIONS] Master switch -> {state}")
+    return {
+        "ok":      True,
+        "enabled": _OPTIONS_ENABLED,
+        "message": f"Options processing is now {state}. "
+                   + ("NSE option-chain calls will resume." if _OPTIONS_ENABLED
+                      else "All NSE option-chain calls are short-circuited; "
+                           "Chartink Live Feed + yfinance will get full HTTP pool."),
+    }
 
 @app.get("/api/tickers")
 async def get_tickers():
@@ -2781,11 +2948,804 @@ async def delete_pnl_trade(trade_id: str):
 
 
 # ─────────────────────────────────────────────────────────────
+#  TRADE LOG — Paper Trading Journal for Chartink Prime Targets
+# ─────────────────────────────────────────────────────────────
+# Tracks simulated trades on Prime Target stocks. Each trade records:
+#   • Entry: ticker, price, date, quantity, target %, stop %, notes
+#   • Live: MTM P&L computed on-demand from yfinance current_price
+#   • Exit:  exit price, exit date, realized P&L, days held, hit_target
+#
+# Storage: trade_log.json (atomic writes via _wj → survives server restarts)
+# Polling: frontend refreshes MTM once per minute (no backend scheduler needed)
+#
+# Relationship to existing PnL tracker (/api/pnl/*):
+#   The PnL tracker is for SHORT CE option positions (real options trades).
+#   THIS trade log is for EQUITY paper-trading on Prime Target breakouts.
+#   They are intentionally separate — different instruments, different schemas.
+
+class TradeLogEntryRequest(BaseModel):
+    """Open a new paper trade on a Prime Target stock."""
+    ticker:        str
+    entry_price:   float
+    entry_date:    Optional[str] = None    # ISO date "YYYY-MM-DD", defaults to today IST
+    quantity:      Optional[int]   = 1
+    target_pct:    Optional[float] = 3.0   # % gain target (3% = classic EMA9 breakout target)
+    stop_pct:      Optional[float] = 0.0   # % stop loss (0 = no stop)
+    notes:         Optional[str]   = ""
+    # Snapshot of signal data at entry time — lets the trade log stand on
+    # its own even if the source signal later disappears from the screener.
+    signal_data:   Optional[Dict]  = None
+
+class TradeLogExitRequest(BaseModel):
+    """Close an open paper trade at the user-specified exit price."""
+    exit_price:    float
+    exit_date:     Optional[str] = None    # ISO date, defaults to today IST
+    notes:         Optional[str] = None    # optional exit notes appended to existing
+
+def _make_trade_id(ticker: str, entry_date: str) -> str:
+    """Stable ID: TICKER_YYYYMMDD_HHMMSS — collisions extremely unlikely
+    because the user opens trades one at a time via the modal."""
+    ts = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
+    return f"{ticker.upper()}_{entry_date.replace('-', '')}_{ts}"
+
+def _trade_log_compute_metrics(trade: Dict, current_price: Optional[float] = None) -> Dict:
+    """
+    Compute MTM P&L + progress-to-target for a single trade.
+    Pure function — does NOT mutate the input trade dict.
+    Used by GET /api/trade-log (for open trades) and at exit time.
+    """
+    entry_price = float(trade.get("entry_price", 0) or 0)
+    qty         = int(trade.get("quantity", 1) or 1)
+    target_pct  = float(trade.get("target_pct", 0) or 0)
+    stop_pct    = float(trade.get("stop_pct", 0) or 0)
+    status      = trade.get("status", "open")
+
+    if status == "closed":
+        # Realized metrics — use stored exit price
+        exit_price = float(trade.get("exit_price", 0) or 0)
+        pnl_amount = round((exit_price - entry_price) * qty, 2)
+        pnl_pct    = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
+        target_price = round(entry_price * (1 + target_pct / 100), 2)
+        return {
+            "current_price":   exit_price,
+            "pnl_amount":      pnl_amount,
+            "pnl_pct":         pnl_pct,
+            "target_price":    target_price,
+            "progress_pct":    round(pnl_pct / target_pct * 100, 1) if target_pct > 0 else 0.0,
+            "hit_target":      bool(trade.get("hit_target", exit_price >= target_price if target_price else False)),
+            "hit_stop":        False,  # computed at exit time, stored on trade
+        }
+
+    # Open trade — MTM using current_price
+    cp = float(current_price) if current_price is not None else None
+    if cp is None or entry_price <= 0:
+        target_price = round(entry_price * (1 + target_pct / 100), 2) if target_pct else None
+        stop_price   = round(entry_price * (1 - stop_pct / 100), 2) if stop_pct else None
+        return {
+            "current_price":   None,
+            "pnl_amount":      None,
+            "pnl_pct":         None,
+            "target_price":    target_price,
+            "stop_price":      stop_price,
+            "progress_pct":    None,
+            "hit_target":      False,
+            "hit_stop":        False,
+        }
+
+    pnl_amount = round((cp - entry_price) * qty, 2)
+    pnl_pct    = round((cp - entry_price) / entry_price * 100, 2)
+    target_price = round(entry_price * (1 + target_pct / 100), 2) if target_pct else None
+    stop_price   = round(entry_price * (1 - stop_pct / 100), 2) if stop_pct else None
+    progress_pct = round(pnl_pct / target_pct * 100, 1) if target_pct > 0 else 0.0
+    return {
+        "current_price":   cp,
+        "pnl_amount":      pnl_amount,
+        "pnl_pct":         pnl_pct,
+        "target_price":    target_price,
+        "stop_price":      stop_price,
+        "progress_pct":    progress_pct,
+        "hit_target":      bool(target_price and cp >= target_price),
+        "hit_stop":        bool(stop_price and cp <= stop_price),
+    }
+
+
+@app.get("/api/trade-log")
+async def get_trade_log(status: Optional[str] = None):
+    """
+    List all paper trades. Optional ?status=open|closed filter.
+    For open trades, attaches MTM P&L computed from yfinance current_price
+    (one quick_info call per unique open ticker — typically <2s total).
+    """
+    data = load_trade_log()
+    trades = data.get("trades", []) if isinstance(data, dict) else []
+
+    # Filter by status if requested
+    if status in ("open", "closed"):
+        trades = [t for t in trades if t.get("status") == status]
+
+    # For open trades, fetch current prices in bulk (deduped tickers)
+    # so the frontend doesn't have to make N separate quick-scan calls.
+    open_tickers = list({t["ticker"] for t in trades
+                         if t.get("status") == "open" and t.get("ticker")})
+    price_cache: Dict[str, Optional[float]] = {}
+    if open_tickers:
+        for tk in open_tickers:
+            try:
+                # get_current_price uses yfinance fast_info — fast, no NSE call.
+                # Safe to call even when options toggle is OFF.
+                price_cache[tk] = get_current_price(tk)
+            except Exception as e:
+                print(f"[TradeLog] price fetch failed for {tk}: {e}")
+                price_cache[tk] = None
+
+    # Attach computed metrics to each trade
+    enriched = []
+    for t in trades:
+        cp = price_cache.get(t.get("ticker")) if t.get("status") == "open" else None
+        metrics = _trade_log_compute_metrics(t, cp)
+        enriched.append({**t, **metrics})
+
+    return {
+        "trades":    enriched,
+        "count":     len(enriched),
+        "open":      len([t for t in enriched if t.get("status") == "open"]),
+        "closed":    len([t for t in enriched if t.get("status") == "closed"]),
+    }
+
+
+@app.post("/api/trade-log/entry")
+async def open_trade_log_entry(req: TradeLogEntryRequest):
+    """Open a new paper trade on a Prime Target stock."""
+    ticker = req.ticker.strip().upper().replace(".NS", "").replace(".BO", "")
+    if not ticker:
+        raise HTTPException(400, "Ticker is required")
+    if req.entry_price <= 0:
+        raise HTTPException(400, "Entry price must be positive")
+
+    entry_date = req.entry_date or datetime.now(IST).strftime("%Y-%m-%d")
+    trade_id   = _make_trade_id(ticker, entry_date)
+
+    trade = {
+        "trade_id":     trade_id,
+        "ticker":       ticker,
+        "entry_price":  float(req.entry_price),
+        "entry_date":   entry_date,
+        "quantity":     int(req.quantity or 1),
+        "target_pct":   float(req.target_pct or 3.0),
+        "stop_pct":     float(req.stop_pct or 0.0),
+        "notes":        (req.notes or "").strip(),
+        "signal_data":  req.signal_data or None,
+        "status":       "open",
+        "exit_price":   None,
+        "exit_date":    None,
+        "pnl_amount":   None,
+        "pnl_pct":      None,
+        "days_held":    None,
+        "hit_target":   False,
+        "hit_stop":     False,
+        "created_at":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    data = load_trade_log()
+    if not isinstance(data, dict):
+        data = {"trades": []}
+    if "trades" not in data:
+        data["trades"] = []
+    data["trades"].append(trade)
+    save_trade_log(data)
+    print(f"[TradeLog] OPENED {trade_id} @ ₹{trade['entry_price']} "
+          f"target=+{trade['target_pct']}% qty={trade['quantity']}")
+    return {"ok": True, "trade": trade}
+
+
+@app.put("/api/trade-log/{trade_id}/exit")
+async def close_trade_log_entry(trade_id: str, req: TradeLogExitRequest):
+    """Close an open paper trade at the given exit price."""
+    if req.exit_price <= 0:
+        raise HTTPException(400, "Exit price must be positive")
+
+    data = load_trade_log()
+    trades = data.get("trades", []) if isinstance(data, dict) else []
+    trade = next((t for t in trades if t.get("trade_id") == trade_id), None)
+    if not trade:
+        raise HTTPException(404, f"Trade {trade_id} not found")
+    if trade.get("status") == "closed":
+        raise HTTPException(409, f"Trade {trade_id} is already closed")
+
+    exit_price = float(req.exit_price)
+    exit_date  = req.exit_date or datetime.now(IST).strftime("%Y-%m-%d")
+    entry_price = float(trade["entry_price"])
+    qty         = int(trade.get("quantity", 1))
+    target_pct  = float(trade.get("target_pct", 0))
+    stop_pct    = float(trade.get("stop_pct", 0))
+
+    # Realized P&L
+    pnl_amount = round((exit_price - entry_price) * qty, 2)
+    pnl_pct    = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
+
+    # Days held (calendar days — simple and deterministic; the user's request
+    # says "how many days" without specifying trading days, so we use calendar
+    # days for transparency. Could be upgraded to trading days later.)
+    try:
+        entry_dt = datetime.strptime(trade["entry_date"], "%Y-%m-%d")
+        exit_dt  = datetime.strptime(exit_date, "%Y-%m-%d")
+        days_held = max((exit_dt - entry_dt).days, 0)
+    except Exception:
+        days_held = None
+
+    # Did we hit target / stop?
+    target_price = entry_price * (1 + target_pct / 100) if target_pct else None
+    stop_price   = entry_price * (1 - stop_pct / 100) if stop_pct else None
+    hit_target   = bool(target_price and exit_price >= target_price)
+    hit_stop     = bool(stop_price and exit_price <= stop_price)
+
+    # Append exit notes if provided
+    if req.notes:
+        existing_notes = trade.get("notes", "") or ""
+        trade["notes"] = (existing_notes + "\n[Exit] " + req.notes.strip()).strip()
+
+    trade.update({
+        "status":      "closed",
+        "exit_price":  exit_price,
+        "exit_date":   exit_date,
+        "pnl_amount":  pnl_amount,
+        "pnl_pct":     pnl_pct,
+        "days_held":   days_held,
+        "hit_target":  hit_target,
+        "hit_stop":    hit_stop,
+        "updated_at":  datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    save_trade_log(data)
+    print(f"[TradeLog] CLOSED {trade_id} @ ₹{exit_price}  P&L ₹{pnl_amount} "
+          f"({pnl_pct}%)  days={days_held}  hit_target={hit_target}")
+    return {"ok": True, "trade": trade}
+
+
+@app.delete("/api/trade-log/{trade_id}")
+async def delete_trade_log_entry(trade_id: str, hard: bool = False):
+    """
+    Remove a trade from the log.
+    ?hard=false (default): keeps the trade but marks it as "deleted" —
+        useful if you want to keep history for audit but hide it from the UI.
+    ?hard=true: permanently removes the trade from trade_log.json.
+    """
+    data = load_trade_log()
+    trades = data.get("trades", []) if isinstance(data, dict) else []
+    if hard:
+        new_trades = [t for t in trades if t.get("trade_id") != trade_id]
+        if len(new_trades) == len(trades):
+            raise HTTPException(404, f"Trade {trade_id} not found")
+        data["trades"] = new_trades
+        save_trade_log(data)
+        print(f"[TradeLog] HARD-DELETED {trade_id}")
+        return {"ok": True, "remaining": len(new_trades), "action": "hard_delete"}
+    else:
+        trade = next((t for t in trades if t.get("trade_id") == trade_id), None)
+        if not trade:
+            raise HTTPException(404, f"Trade {trade_id} not found")
+        trade["status"]      = "deleted"
+        trade["updated_at"]  = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+        save_trade_log(data)
+        print(f"[TradeLog] SOFT-DELETED {trade_id}")
+        return {"ok": True, "action": "soft_delete", "trade": trade}
+
+
+@app.get("/api/trade-log/metrics")
+async def get_trade_log_metrics():
+    """
+    Aggregated stats across all closed trades:
+      • Win rate (closed trades with pnl_amount > 0 / total closed)
+      • Total realized P&L
+      • Avg days held (closed only)
+      • Avg days to target (closed trades that hit target)
+      • Best / worst trade
+      • Target hit rate (closed trades that hit target / total closed)
+    Open trades are listed separately with their MTM P&L.
+    """
+    data = load_trade_log()
+    trades = data.get("trades", []) if isinstance(data, dict) else []
+    closed = [t for t in trades if t.get("status") == "closed"]
+    open_  = [t for t in trades if t.get("status") == "open"]
+
+    # Fetch current prices for open trades to compute MTM
+    open_tickers = list({t["ticker"] for t in open_ if t.get("ticker")})
+    price_cache: Dict[str, Optional[float]] = {}
+    for tk in open_tickers:
+        try:
+            price_cache[tk] = get_current_price(tk)
+        except Exception:
+            price_cache[tk] = None
+
+    closed_pnls    = [float(t.get("pnl_amount", 0) or 0) for t in closed]
+    closed_days    = [t.get("days_held") for t in closed if t.get("days_held") is not None]
+    target_winners = [t for t in closed if t.get("hit_target")]
+    target_win_days= [t.get("days_held") for t in target_winners if t.get("days_held") is not None]
+
+    open_mtm = []
+    for t in open_:
+        cp = price_cache.get(t.get("ticker"))
+        m  = _trade_log_compute_metrics(t, cp)
+        open_mtm.append({**t, **m})
+
+    open_mtm_total = sum(m.get("pnl_amount") or 0 for m in open_mtm)
+
+    return {
+        "open_count":         len(open_),
+        "closed_count":       len(closed),
+        "win_count":          len([p for p in closed_pnls if p > 0]),
+        "loss_count":         len([p for p in closed_pnls if p < 0]),
+        "breakeven_count":    len([p for p in closed_pnls if p == 0]),
+        "win_rate_pct":       round(len([p for p in closed_pnls if p > 0]) / len(closed_pnls) * 100, 1) if closed_pnls else 0.0,
+        "total_realized_pnl": round(sum(closed_pnls), 2) if closed_pnls else 0.0,
+        "open_mtm_pnl":       round(open_mtm_total, 2),
+        "combined_pnl":       round(sum(closed_pnls) + open_mtm_total, 2),
+        "avg_days_held":      round(sum(closed_days) / len(closed_days), 1) if closed_days else 0.0,
+        "target_hit_count":   len(target_winners),
+        "target_hit_rate_pct": round(len(target_winners) / len(closed) * 100, 1) if closed else 0.0,
+        "avg_days_to_target": round(sum(target_win_days) / len(target_win_days), 1) if target_win_days else 0.0,
+        "best_trade_pnl":     max(closed_pnls) if closed_pnls else 0.0,
+        "worst_trade_pnl":    min(closed_pnls) if closed_pnls else 0.0,
+        "open_trades":        open_mtm,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+#  FUNDAMENTAL FILTER — Piotroski-lite 5-check score per ticker
+# ─────────────────────────────────────────────────────────────
+# Goal: avoid stocks where the market is reacting to a real deterioration in
+# business quality (e.g. RBL Bank's asset quality, Syngene's margin
+# compression). The technical entry logic (FV + Resistance Gap + 9 EMA)
+# catches the price action, but cannot distinguish between sentiment-driven
+# drawdowns (recoverable) and fundamental deterioration (often permanent).
+#
+# 5 checks (each = 1 point, total 0-5):
+#   1. OCF > 0 (TTM operating cash flow, from cashflow statement)
+#   2. ROE ≥ 12% (return on equity, from yfinance info)
+#   3. Revenue Growth ≥ 0% YoY (latest quarter YoY, from info)
+#   4. Earnings Growth ≥ 0% YoY (proxy for margin trend)
+#   5. Debt-to-Equity < 1.0  (skipped/auto-passed for Financial sector)
+#
+# Verdicts:
+#   🟢 HEALTHY  = score 4-5  → safe to trade
+#   🟡 CAUTION  = score 3    → trade with care, investigate why
+#   🔴 AVOID    = score 0-2  → fundamental deterioration, skip
+#   ⚪ NO_DATA  = yfinance fetch failed
+#
+# Data source: yfinance (info dict + annual cashflow). One HTTP call per
+# ticker for info + one for cashflow. Cached to fundamentals_cache.json
+# (refreshed on-demand via the Fundamentals tab → "Refresh Now" button).
+# Data lags by 1-3 months (quarterly results); the filter is a rear-view
+# mirror, not a windshield.
+
+import csv as _csv_module
+
+# ── NaN/Infinity sanitizer ─────────────────────────────────────────────────
+# yfinance frequently returns float('nan') for missing fields (ROE, OCF, etc.)
+# when a stock's data is incomplete. FastAPI's JSONResponse uses
+# allow_nan=False, so any NaN value crashes the endpoint with:
+#   ValueError: Out of range float values are not JSON compliant: nan
+# This helper recursively walks a dict/list/float and converts NaN/Infinity
+# to None (which serializes to JSON null). Applied to every fundamentals
+# response so the issue can NEVER reoccur regardless of what yfinance returns.
+def _sanitize_nan(obj):
+    """Recursively convert NaN/Infinity floats to None. Handles dict/list/scalar."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_nan(v) for v in obj]
+    return obj
+
+def _is_valid_number(v) -> bool:
+    """True only if v is a finite number (not None, not NaN, not Infinity).
+    Used by _compute_fundamental_score to decide whether a metric qualifies
+    for the score computation — yfinance returns NaN for missing fields, and
+    `nan is not None` returns True, so the existing `if x is not None:` guards
+    would silently treat NaN as 0-failing-the-check instead of N/A."""
+    if v is None:
+        return False
+    try:
+        f = float(v)
+        return not (math.isnan(f) or math.isinf(f))
+    except (TypeError, ValueError):
+        return False
+
+def load_master_tickers() -> List[Dict]:
+    """
+    Read the master tickers.csv. Returns list of {sr_no, security, symbol}.
+    Accepts CSVs with at least a SYMBOL column; SECURITY (company name) and
+    Sr. No. are preserved if present, so the exported CSV matches the user's
+    uploaded format exactly.
+    """
+    if not os.path.exists(TICKERS_FILE):
+        return []
+    rows = []
+    try:
+        with open(TICKERS_FILE, newline="", encoding="utf-8-sig") as f:
+            reader = _csv_module.DictReader(f)
+            for i, row in enumerate(reader, 1):
+                symbol = (row.get("SYMBOL") or row.get("Symbol") or row.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                rows.append({
+                    "sr_no":   (row.get("Sr. No.") or row.get("Sr No") or str(i)).strip(),
+                    "security": (row.get("SECURITY") or row.get("Security") or row.get("Company") or symbol).strip(),
+                    "symbol":  symbol,
+                })
+    except Exception as e:
+        print(f"[Fundamentals] Failed to read {TICKERS_FILE}: {e}")
+    return rows
+
+
+def _fetch_yf_fundamentals(symbol: str) -> Dict:
+    """
+    Fetch fundamental metrics from yfinance for one Indian ticker.
+    Returns a dict of raw metrics (or {"error": ...} on failure).
+    All percentage/ratio fields are kept in their native yfinance units:
+      - roe, roa, operating_margins, profit_margins, revenue_growth,
+        earnings_growth: decimals (0.15 = 15%)
+      - debt_to_equity: percentage (50 = 0.5x)
+      - ocf_ttm: rupees (raw, will be normalized to ₹Cr in the UI)
+    """
+    yf_ticker = f"{symbol}.NS"
+    try:
+        t   = yf.Ticker(yf_ticker)
+        inf = t.info or {}
+        # Operating cash flow (TTM) — fetch from annual cashflow statement.
+        # yfinance returns this as a DataFrame with quarters/years as columns.
+        ocf_ttm = None
+        try:
+            cf = t.cashflow
+            if cf is not None and not cf.empty:
+                # Try common row labels across yfinance versions
+                for label in ("Total Cash From Operating Activities",
+                              "Operating Cash Flow",
+                              "Total Cash Flow From Operating Activities"):
+                    if label in cf.index:
+                        ocf_ttm = float(cf.loc[label].iloc[0])
+                        break
+        except Exception as _e_cf:
+            # Cashflow fetch failure is non-fatal — we still have info dict.
+            pass
+
+        return _sanitize_nan({
+            "symbol":           symbol,
+            "name":             inf.get("longName") or inf.get("shortName") or symbol,
+            "sector":           inf.get("sector") or "Unknown",
+            "industry":         inf.get("industry") or "Unknown",
+            "roe":              inf.get("returnOnEquity"),       # decimal
+            "roa":              inf.get("returnOnAssets"),
+            "debt_to_equity":   inf.get("debtToEquity"),          # percentage (50 = 0.5x)
+            "operating_margins": inf.get("operatingMargins"),     # decimal
+            "profit_margins":   inf.get("profitMargins"),
+            "revenue_growth":   inf.get("revenueGrowth"),         # decimal YoY
+            "earnings_growth":  inf.get("earningsGrowth"),        # decimal YoY
+            "ocf_ttm":          ocf_ttm,
+            "market_cap":       inf.get("marketCap"),
+            "fetched_at":       now_ist_str(),
+        })
+    except Exception as e:
+        return {"symbol": symbol, "error": str(e)[:200], "fetched_at": now_ist_str()}
+
+
+def _compute_fundamental_score(metrics: Dict) -> Dict:
+    """
+    Apply the 5-check Piotroski-lite score. Returns:
+      { score: 0-5, max_score: 5, verdict: '🟢'|'🟡'|'🔴'|'⚪', checks: [...] }
+    Each check entry: { name, passed: True|False|None, value, detail }
+    `passed=None` means data was unavailable; the check is excluded from the
+    denominator for verdict purposes but the score still caps at the count of
+    non-None checks.
+    """
+    if metrics.get("error"):
+        return {
+            "score":     None,
+            "max_score": 5,
+            "verdict":   "⚪ NO_DATA",
+            "checks":    [{"name": "Data fetch", "passed": False, "value": "Error",
+                           "detail": metrics.get("error", "")}],
+        }
+
+    checks = []
+    score  = 0
+
+    # Sector detection — financials get a different treatment for D/E.
+    sector    = metrics.get("sector") or ""
+    industry  = metrics.get("industry") or ""
+    is_financial = (sector == "Financial Services") or \
+                   ("Bank" in industry) or \
+                   ("Finance" in industry) or \
+                   ("Insurance" in industry)
+
+    # ── Check 1: OCF > 0 (TTM) ──────────────────────────────────────────────
+    # Catches profit-quality deterioration — PAT can be positive while OCF
+    # turns negative (working capital stretching, receivables ballooning).
+    # NOTE: _is_valid_number() handles the yfinance NaN case (missing data),
+    # which `ocf is not None` would NOT catch because float('nan') is not None.
+    ocf = metrics.get("ocf_ttm")
+    if _is_valid_number(ocf):
+        passed = ocf > 0
+        checks.append({
+            "name":   "OCF > 0 (TTM)",
+            "passed": passed,
+            "value":  f"₹{ocf/1e7:.1f}Cr" if abs(ocf) >= 1e7 else f"₹{ocf/1e5:.1f}L",
+            "detail": "Operating cash flow positive (TTM)" if passed else "OCF negative — profit-quality concern",
+        })
+        if passed: score += 1
+    else:
+        checks.append({"name": "OCF > 0 (TTM)", "passed": None, "value": "N/A",
+                       "detail": "Cashflow data unavailable"})
+
+    # ── Check 2: ROE ≥ 12% ──────────────────────────────────────────────────
+    # Filters out structurally low-return businesses that look "cheap" on P/E
+    # but never compound. 12% is a sector-neutral floor; IT/Pharma typically
+    # screen much higher, banks screen lower (use ROA there).
+    roe = metrics.get("roe")
+    if _is_valid_number(roe):
+        roe_pct = roe * 100
+        threshold = 8.0 if is_financial else 12.0   # banks: lower bar (ROE ~10-12% is healthy)
+        passed = roe_pct >= threshold
+        checks.append({
+            "name":   f"ROE ≥ {threshold:.0f}%" + (" (Financials floor)" if is_financial else ""),
+            "passed": passed,
+            "value":  f"{roe_pct:.1f}%",
+            "detail": f"Return on equity {'healthy' if passed else 'low — value-trap risk'}",
+        })
+        if passed: score += 1
+    else:
+        checks.append({"name": "ROE ≥ 12%", "passed": None, "value": "N/A",
+                       "detail": "ROE unavailable"})
+
+    # ── Check 3: Revenue Growth ≥ 0% YoY ────────────────────────────────────
+    # Catches shrinking-top-line situations (e.g. Syngene's slowing order book).
+    rg = metrics.get("revenue_growth")
+    if _is_valid_number(rg):
+        rg_pct = rg * 100
+        passed = rg_pct >= 0
+        checks.append({
+            "name":   "Revenue Growth ≥ 0% YoY",
+            "passed": passed,
+            "value":  f"{rg_pct:+.1f}%",
+            "detail": "Top-line growing" if passed else "Revenue shrinking — investigate",
+        })
+        if passed: score += 1
+    else:
+        checks.append({"name": "Revenue Growth ≥ 0% YoY", "passed": None, "value": "N/A",
+                       "detail": "Revenue growth unavailable"})
+
+    # ── Check 4: Earnings Growth ≥ 0% YoY ───────────────────────────────────
+    # Proxy for margin trend: if earnings are declining faster than revenue,
+    # margins are compressing (the Syngene pattern). If earnings are growing
+    # despite revenue softness, margins are expanding (positive operating leverage).
+    eg = metrics.get("earnings_growth")
+    if _is_valid_number(eg):
+        eg_pct = eg * 100
+        passed = eg_pct >= 0
+        checks.append({
+            "name":   "Earnings Growth ≥ 0% YoY",
+            "passed": passed,
+            "value":  f"{eg_pct:+.1f}%",
+            "detail": "Earnings growing" if passed else "Earnings declining — margin compression",
+        })
+        if passed: score += 1
+    else:
+        checks.append({"name": "Earnings Growth ≥ 0% YoY", "passed": None, "value": "N/A",
+                       "detail": "Earnings growth unavailable"})
+
+    # ── Check 5: D/E < 1.0 (auto-pass for Financials) ───────────────────────
+    # Catches leveraged balance sheets under stress. For banks/NBFCs, D/E is
+    # structurally different (deposits = liabilities) so the check is auto-passed
+    # and the user is told it was skipped.
+    if is_financial:
+        checks.append({
+            "name":   "D/E < 1.0 (Financial sector — auto-pass)",
+            "passed": True,
+            "value":  "N/A",
+            "detail": f"Skipped for {sector}/{industry} — D/E not meaningful for financials",
+        })
+        score += 1
+    else:
+        de = metrics.get("debt_to_equity")
+        if _is_valid_number(de):
+            # yfinance returns D/E as a percentage (e.g. 50 means 0.5x).
+            de_ratio = de / 100.0
+            passed = de_ratio < 1.0
+            checks.append({
+                "name":   "D/E < 1.0",
+                "passed": passed,
+                "value":  f"{de_ratio:.2f}x",
+                "detail": "Leverage manageable" if passed else "High leverage — stress risk",
+            })
+            if passed: score += 1
+        else:
+            checks.append({"name": "D/E < 1.0", "passed": None, "value": "N/A",
+                           "detail": "Balance sheet data unavailable"})
+
+    # ── Verdict ─────────────────────────────────────────────────────────────
+    # Thresholds: 4-5 = HEALTHY, 3 = CAUTION, 0-2 = AVOID
+    # (For tickers with partial data, we still apply the same thresholds —
+    # a low score on partial data is still a yellow flag.)
+    if score is None:
+        verdict = "⚪ NO_DATA"
+    elif score >= 4:
+        verdict = "🟢 HEALTHY"
+    elif score >= 3:
+        verdict = "🟡 CAUTION"
+    else:
+        verdict = "🔴 AVOID"
+
+    return {"score": score, "max_score": 5, "verdict": verdict, "checks": checks}
+
+
+def _run_fundamentals_filter_job(tickers: List[Dict], job_id: str):
+    """
+    Background worker: fetch yfinance fundamentals for every ticker in the
+    master list, compute the 5-check score, and save the full result set to
+    fundamentals_cache.json. Designed to run in asyncio.to_thread so it
+    doesn't block the FastAPI event loop.
+    """
+    total   = len(tickers)
+    results = []
+    for i, t in enumerate(tickers):
+        symbol = t["symbol"]
+        job_log(job_id, f"[{i+1}/{total}] Fetching {symbol}...", "info")
+        try:
+            metrics    = _fetch_yf_fundamentals(symbol)
+            score_data = _compute_fundamental_score(metrics)
+        except Exception as e:
+            metrics    = {"symbol": symbol, "error": str(e)[:200], "fetched_at": now_ist_str()}
+            score_data = {"score": None, "max_score": 5, "verdict": "⚪ NO_DATA",
+                          "checks": [{"name": "Data fetch", "passed": False, "value": "Error", "detail": str(e)[:200]}]}
+
+        results.append({
+            "sr_no":    t["sr_no"],
+            "security": t["security"],
+            "symbol":   symbol,
+            "metrics":  metrics,
+            "score":    score_data["score"],
+            "max_score": score_data["max_score"],
+            "verdict":  score_data["verdict"],
+            "checks":   score_data["checks"],
+        })
+        job_progress(job_id, i + 1, total, symbol)
+        # Be polite to yfinance — small delay between requests
+        if i < total - 1:
+            time.sleep(random.uniform(0.2, 0.4))
+
+    save_fundamentals({
+        "last_run_at":  now_ist_str(),
+        "tickers_path": TICKERS_FILE,
+        "total":        len(results),
+        "results":      results,
+    })
+    job_done(job_id, results)
+    return results
+
+
+@app.get("/api/fundamentals/status")
+async def get_fundamentals_status():
+    """Cache stats: last_run, total scanned, counts by verdict."""
+    cache = load_fundamentals()
+    results = cache.get("results", []) if isinstance(cache, dict) else []
+    counts = {"🟢 HEALTHY": 0, "🟡 CAUTION": 0, "🔴 AVOID": 0, "⚪ NO_DATA": 0}
+    for r in results:
+        v = r.get("verdict", "⚪ NO_DATA")
+        if v in counts: counts[v] += 1
+    return _sanitize_nan({
+        "last_run_at":   cache.get("last_run_at") if isinstance(cache, dict) else None,
+        "total":         len(results),
+        "counts":        counts,
+        "tickers_file":  TICKERS_FILE,
+        "tickers_count": len(load_master_tickers()),
+    })
+
+
+@app.get("/api/fundamentals/filter")
+async def get_fundamentals_filter(score_min: int = 4):
+    """
+    Return all tickers with score >= score_min from the cache.
+    Default threshold = 4 (only 🟢 HEALTHY stocks).
+    Pass score_min=3 to also include 🟡 CAUTION.
+    """
+    if score_min < 0 or score_min > 5:
+        raise HTTPException(400, "score_min must be between 0 and 5")
+    cache   = load_fundamentals()
+    results = cache.get("results", []) if isinstance(cache, dict) else []
+    filtered = [r for r in results
+                if r.get("score") is not None and r.get("score", 0) >= score_min]
+    # ── Critical: sanitize ALL NaN values before returning. yfinance frequently
+    # returns float('nan') for missing metrics (ROE, OCF, etc.), and FastAPI's
+    # JSONResponse uses allow_nan=False which crashes the endpoint with:
+    #   ValueError: Out of range float values are not JSON compliant: nan
+    # _sanitize_nan recursively converts NaN/Infinity → None (JSON null).
+    return _sanitize_nan({
+        "last_run_at": cache.get("last_run_at") if isinstance(cache, dict) else None,
+        "score_min":   score_min,
+        "filtered":    len(filtered),
+        "total":       len(results),
+        "results":     filtered,
+    })
+
+
+@app.post("/api/fundamentals/refresh")
+async def refresh_fundamentals(background_tasks: BackgroundTasks):
+    """
+    Trigger a background refresh: fetch yfinance fundamentals for every
+    ticker in tickers.csv, recompute scores, save to cache.
+    Returns a job_id for SSE progress streaming via /api/jobs/{job_id}/stream.
+    """
+    tickers = load_master_tickers()
+    if not tickers:
+        raise HTTPException(400, f"No tickers found in {TICKERS_FILE}. "
+                                 "Upload a CSV via /api/tickers/upload first.")
+    job_id = create_job()
+    background_tasks.add_task(asyncio.to_thread,
+                              _run_fundamentals_filter_job, tickers, job_id)
+    return {"job_id": job_id, "total": len(tickers),
+            "message": f"Refreshing fundamentals for {len(tickers)} tickers in background"}
+
+
+@app.get("/api/fundamentals/export")
+async def export_fundamentals_csv(score_min: int = 4):
+    """
+    Export filtered tickers as CSV in the user's 3-column format:
+        Sr. No.,SECURITY,SYMBOL
+        1,ACC Limited,ACC
+        ...
+    The output is ready to upload to Chartink screener or Duration Backtest.
+    """
+    if score_min < 0 or score_min > 5:
+        raise HTTPException(400, "score_min must be between 0 and 5")
+    cache   = load_fundamentals()
+    results = cache.get("results", []) if isinstance(cache, dict) else []
+    filtered = [r for r in results
+                if r.get("score") is not None and r.get("score", 0) >= score_min]
+
+    # Use the company name from yfinance if available (more accurate than the
+    # CSV's SECURITY column); otherwise fall back to the CSV's value.
+    # Build CSV in memory.
+    output = io.StringIO()
+    # BOM for Excel UTF-8 detection
+    output.write("\ufeff")
+    writer = _csv_module.writer(output, lineterminator="\r\n")
+    writer.writerow(["Sr. No.", "SECURITY", "SYMBOL"])
+    for i, r in enumerate(filtered, 1):
+        sec = (r.get("metrics", {}) or {}).get("name") or r.get("security") or r.get("symbol", "")
+        # CSV-quote if name contains a comma
+        writer.writerow([i, sec, r.get("symbol", "")])
+
+    csv_bytes = output.getvalue().encode("utf-8")
+    filename = f"fundamentals_filtered_score{score_min}_{datetime.now(IST).strftime('%Y-%m-%d')}.csv"
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.delete("/api/fundamentals/cache")
+async def clear_fundamentals_cache():
+    """Clear the fundamentals cache (forces next /refresh to re-fetch from scratch)."""
+    save_fundamentals({"results": []})
+    return {"ok": True, "message": "Fundamentals cache cleared"}
+
+
+# ─────────────────────────────────────────────────────────────
 #  STARTUP
 # ─────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
     cfg = load_config()
+    # ── Hydrate the in-memory options toggle from disk on boot ──────────────
+    # This ensures the toggle state from a previous session is respected,
+    # e.g. if the user disabled options yesterday and restarts the server today.
+    _refresh_options_enabled_from_config()
+    print(f"[STARTUP] Options processing = {'ENABLED' if _OPTIONS_ENABLED else 'DISABLED'} "
+          f"(loaded from config.json)")
     if cfg.get("auto_scan_enabled"):
         start_scheduler(cfg)
     start_chartink_scheduler()   # auto-poll Chartink every 5 min

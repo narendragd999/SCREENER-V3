@@ -10,6 +10,7 @@ Fixes applied IN ema9_router.py (without modifying sma_router.py):
 """
 
 import os, io, asyncio, datetime as dt_module, time, math, logging, pickle, json
+import threading as _threading
 from typing import Optional, List, Dict
 import httpx
 
@@ -98,11 +99,96 @@ FV_FAIL_CACHE_FILE = os.path.join(CACHE_DIR, "fv_fail_cache.pkl")
 # ─────────────────────────────────────────────────────────────
 YF_CHUNK_SIZE    = 100
 YF_CHUNK_DELAY   = 2.0
-FV_INTER_DELAY   = 1.5
+# ── screener.in rate-limit (set explicitly to 20 calls / minute) ──
+# screener.in responds with HTTP 429 once you exceed ~30 req/min.
+# We hard-cap to 20 req/min (3.0s between calls) to leave head-room.
+#   FV_INTER_DELAY  → inter-call sleep used by the SEQUENTIAL pipeline
+#                     (_run_screen_pipeline). 60 / 20 = 3.0 seconds.
+#   FV_MAX_CALLS_PER_MIN → enforced by the async token-bucket limiter
+#                     (_ScreenerRateLimiter) used by the CONCURRENT
+#                     pipelines (backtest + duration-backtest FV fetch).
+FV_INTER_DELAY         = 3.0   # 60s / 20 calls = 3s gap → 20 req/min
+FV_MAX_CALLS_PER_MIN   = 20    # hard cap on screener.in calls per 60s window
 FV_MAX_RETRIES   = 2
 FV_RETRY_DELAY   = 3.0
 MIN_HISTORY_DAYS = 60
 DOWNLOAD_PERIOD  = "10y"
+# Default stop-loss %. 0.0 = SL disabled (pure target/max-hold strategy).
+# The user can override this per-backtest via the request payload.
+DEFAULT_STOPLOSS_PCT = 5.0
+
+
+# ─────────────────────────────────────────────────────────────
+#  SCREENER.IN RATE LIMITER (token-bucket, 20 req/min)
+# ─────────────────────────────────────────────────────────────
+# A thread-safe sliding-window rate limiter that caps how many
+# screener.in calls sma_router._analyze_ticker can make per minute.
+# Used by the async FV enrichment paths in /api/ema9/backtest and
+# /api/ema9/duration-backtest (which fan out N concurrent FV fetches).
+#
+# Why a token-bucket instead of just sleep(3.0)?
+#   Sequential sleep(3.0) is safe but slow (200 tickers × 3s = 10 min).
+#   A token-bucket lets us *burst* up to N calls when the bucket is full
+#   and then throttle to exactly 20/min sustained — fast AND safe.
+class _ScreenerRateLimiter:
+    """Sliding-window rate limiter for screener.in calls.
+
+    Thread-safe. Allows up to `max_calls` calls in any rolling `window_sec`
+    window. Acquire() blocks (sync) until a slot is free.
+    """
+    def __init__(self, max_calls: int = FV_MAX_CALLS_PER_MIN, window_sec: float = 60.0):
+        self.max_calls = max_calls
+        self.window_sec = window_sec
+        self._calls: List[float] = []   # timestamps of recent calls
+        self._lock = _threading.Lock()
+
+    def acquire(self) -> float:
+        """Block until a slot is free. Returns wait time in seconds (0 if no wait)."""
+        while True:
+            with self._lock:
+                now = time.time()
+                # Drop timestamps outside the window
+                self._calls = [t for t in self._calls if now - t < self.window_sec]
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return 0.0
+                # Window full — compute sleep until the oldest call falls out
+                oldest = self._calls[0]
+                sleep_for = oldest + self.window_sec - now + 0.05  # +50ms safety
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+    async def acquire_async(self) -> float:
+        """Async version of acquire(). Blocks the coroutine (not the event loop)
+        until a slot is free."""
+        while True:
+            with self._lock:
+                now = time.time()
+                self._calls = [t for t in self._calls if now - t < self.window_sec]
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return 0.0
+                oldest = self._calls[0]
+                sleep_for = oldest + self.window_sec - now + 0.05
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+    def stats(self) -> Dict:
+        with self._lock:
+            now = time.time()
+            self._calls = [t for t in self._calls if now - t < self.window_sec]
+            return {
+                "calls_in_last_window": len(self._calls),
+                "max_calls_per_window": self.max_calls,
+                "window_sec":           self.window_sec,
+                "remaining":            max(0, self.max_calls - len(self._calls)),
+            }
+
+
+# Global rate-limiter singleton — shared across all FV fetches.
+# Even with FV_CONCURRENCY=4 concurrent fetches, this limiter guarantees
+# the AGGREGATE rate to screener.in stays under 20 req/min.
+_screener_limiter = _ScreenerRateLimiter(max_calls=FV_MAX_CALLS_PER_MIN, window_sec=60.0)
 
 # Cache TTLs (seconds)
 YF_CACHE_TTL_SEC       = 4 * 3600   # 4 hours — yfinance data updates once daily (EOD)
@@ -123,7 +209,8 @@ MAX_CACHE_ENTRIES      = 500        # LRU cap — evict oldest when exceeded
 #  a timestamp. TTL is 4 hours for price data (yfinance updates EOD) and
 #  12 hours for FV (fundamentals change slowly).
 # ─────────────────────────────────────────────────────────────
-import threading as _threading
+# (Note: `import threading as _threading` is at the top of the file so the
+#  _ScreenerRateLimiter class — defined above — can use it.)
 
 _yf_cache: Dict[str, dict] = {}    # {ticker: {"df": DataFrame, "ts": float, "hits": int}}
 _fv_cache: Dict[str, dict] = {}    # {ticker: {"fv": dict, "ts": float, "hits": int}} — successful FV only
@@ -902,10 +989,23 @@ def _backtest_ticker(
     target_pct:      float = 3.0,
     max_hold_days:   int   = 15,
     require_uptrend: bool  = True,
+    stoploss_pct:    float = 0.0,
 ) -> Dict:
     """
     Walk-forward backtest for 9EMA breakout strategy on a single ticker.
     Returns a dict with per-trade list and aggregate statistics.
+
+    STOP-LOSS (added v3.4):
+      If stoploss_pct > 0, every trade gets a stop-loss price at
+          stoploss_price = entry_price * (1 - stoploss_pct/100)
+      On each day the trade is open, the intraday Low is checked against
+      the stop-loss. If Low <= stoploss_price, the trade exits immediately
+      at the stop-loss price with outcome="STOPLOSS" and
+      stoploss_triggered=True.
+      Exit precedence on the SAME bar (when both target AND stop-loss are
+      touched intraday): STOPLOSS fires first (conservative — assumes the
+      Low printed before the High).
+      If stoploss_pct == 0, no stop-loss is applied (legacy behaviour).
     """
     df = df.copy().dropna()
     n  = len(df)
@@ -930,6 +1030,7 @@ def _backtest_ticker(
     in_trade = False
     entry_idx: int = 0
     entry_price: float = 0.0
+    stoploss_price: float = 0.0  # 0.0 means SL disabled for this trade
     breakout_date: str = ""
     confirm_date:  str = ""
     signal_idx:    int = 0   # confirm candle index (=entry)
@@ -940,15 +1041,25 @@ def _backtest_ticker(
         if in_trade:
             days_held = i - entry_idx
             high_today  = float(df["High"].iloc[i])
+            low_today   = float(df["Low"].iloc[i])
             close_today = float(df["Close"].iloc[i])
             target_price = round(entry_price * (1 + target_pct / 100), 2)
 
             outcome  = None
             exit_px  = None
             exit_date = _date(i)
+            sl_hit_today = False  # per-bar SL trigger flag
 
-            # Only exit: Target hit (use intraday High). No force-exit ever.
-            if high_today >= target_price:
+            # ── Stop-loss check (checked BEFORE target — conservative) ──
+            # If stoploss_pct > 0 and the intraday Low touches/breaches the
+            # stop-loss level, the trade exits at the SL price immediately.
+            # This makes "STOPLOSS" take precedence over "WIN" on the same bar.
+            if stoploss_price > 0 and low_today <= stoploss_price:
+                outcome = "STOPLOSS"
+                exit_px = stoploss_price
+                sl_hit_today = True
+            # ── Target hit (use intraday High). No force-exit ever. ──
+            elif high_today >= target_price:
                 outcome = "WIN"
                 exit_px = target_price
 
@@ -976,18 +1087,23 @@ def _backtest_ticker(
                     trend_at_entry = "SIDEWAYS"
 
                 trades.append({
-                    "ticker":        ticker,
-                    "breakout_date": breakout_date,
-                    "entry_date":    confirm_date,
-                    "entry_price":   round(entry_price, 2),
-                    "target_price":  target_price,
-                    "exit_date":     exit_date,
-                    "exit_price":    round(exit_px, 2),
-                    "days_held":     days_held,
-                    "gain_pct":      gain_pct,
-                    "outcome":       outcome,
-                    "is_win":        outcome == "WIN",
-                    "trend_regime":  trend_at_entry,
+                    "ticker":               ticker,
+                    "breakout_date":        breakout_date,
+                    "entry_date":           confirm_date,
+                    "entry_price":          round(entry_price, 2),
+                    "target_price":         target_price,
+                    # ── Stop-loss fields (v3.4) ──
+                    "stoploss_pct":         round(stoploss_pct, 2) if stoploss_pct > 0 else 0.0,
+                    "stoploss_price":       round(stoploss_price, 2) if stoploss_price > 0 else None,
+                    "stoploss_triggered":   bool(sl_hit_today),
+                    "stoploss_hit_date":    exit_date if sl_hit_today else None,
+                    "exit_date":            exit_date,
+                    "exit_price":           round(exit_px, 2),
+                    "days_held":            days_held,
+                    "gain_pct":             gain_pct,
+                    "outcome":              outcome,
+                    "is_win":               outcome == "WIN",
+                    "trend_regime":         trend_at_entry,
                 })
                 in_trade = False
             # Trade still open — fall through to check for new breakout signals (record as skipped)
@@ -1091,6 +1207,13 @@ def _backtest_ticker(
         entry_price = conf_close
         breakout_date = _date(i)
         confirm_date  = _date(i + 1)
+        # ── Compute stop-loss price for this trade (v3.4) ──
+        # stoploss_pct == 0 means SL disabled → stoploss_price stays 0.0
+        # and the SL check in the exit logic is skipped.
+        if stoploss_pct > 0:
+            stoploss_price = round(conf_close * (1 - stoploss_pct / 100), 2)
+        else:
+            stoploss_price = 0.0
         # Note: Python for-loops ignore reassignment of i, so the confirm candle (i+1)
         # will be evaluated as the first exit-check bar on the next iteration.
         # days_held will be 0 on that bar — WIN check on confirm bar's High is intentional
@@ -1107,6 +1230,7 @@ def _backtest_ticker(
                 "wins":            0,
                 "losses":          0,
                 "timeouts":        0,
+                "stoploss_hits":   0,
                 "win_rate_pct":    None,
                 "avg_gain_pct":    None,
                 "avg_win_pct":     None,
@@ -1121,6 +1245,7 @@ def _backtest_ticker(
     wins      = [t for t in trades if t["outcome"] == "WIN"]
     losses    = [t for t in trades if t["outcome"] != "WIN"]
     timeouts  = [t for t in trades if t["outcome"] == "TIMEOUT"]
+    sl_hits   = [t for t in trades if t.get("stoploss_triggered") is True]
 
     gains     = [t["gain_pct"] for t in trades]
     win_gains = [t["gain_pct"] for t in wins]
@@ -1155,6 +1280,7 @@ def _backtest_ticker(
             "wins":             len(wins),
             "losses":           len(losses) - len(timeouts),
             "timeouts":         len(timeouts),
+            "stoploss_hits":    len(sl_hits),
             "win_rate_pct":     win_rate,
             "avg_gain_pct":     avg_gain,
             "avg_win_pct":      avg_win,
@@ -1171,11 +1297,12 @@ def _backtest_ticker(
 #  DURATION BACKTEST ENGINE (v1.0 — date-range filtered)
 #  Differs from _backtest_ticker in three ways:
 #    1. Only counts trades whose ENTRY date is within [start_date, end_date]
-#    2. Properly exits trades on WIN / LOSS / TIMEOUT (no silent drops)
+#    2. Properly exits trades on WIN / LOSS / TIMEOUT / STOPLOSS (no silent drops)
 #       - WIN     : intraday High >= target  → exit at target, gain = +target%
 #       - LOSS    : max_hold_days reached, exit close < entry  → gain = actual %
 #       - TIMEOUT : max_hold_days reached, exit close >= entry but < target
-#    3. No stop-loss (per user spec) — trades run to target or max_hold_days
+#       - STOPLOSS: intraday Low <= stoploss_price → exit at SL, gain = -SL%
+#    3. Optional stop-loss — trades can exit at SL before max_hold_days
 # ─────────────────────────────────────────────────────────────
 
 def _duration_backtest_ticker(
@@ -1188,6 +1315,7 @@ def _duration_backtest_ticker(
     end_date:        Optional[str] = None,
     resistance_lookback_days: int = 20,
     resistance_threshold_pct: float = 3.0,
+    stoploss_pct:    float = 0.0,
 ) -> Dict:
     """
     Walk-forward backtest for the 9EMA breakout strategy, filtered to a
@@ -1211,11 +1339,16 @@ def _duration_backtest_ticker(
          even if other trades are still open. Multiple trades can run
          simultaneously, each tracked independently with its own exit logic.
 
-    Trade exits:
+    Trade exits (with optional stop-loss, v3.4):
+      - STOPLOSS: if stoploss_pct > 0 AND intraday Low <= stoploss_price →
+                  exit at stoploss_price, gain = -stoploss_pct%, outcome="STOPLOSS"
       - WIN     : intraday High >= target  → exit at target, gain = +target%
       - LOSS    : max_hold_days reached, exit close < entry  → actual negative %
       - TIMEOUT : max_hold_days reached, exit close >= entry but < target
-      No stop-loss (per user spec).
+
+      Same-bar precedence: STOPLOSS > WIN > (LOSS|TIMEOUT at max_hold_days).
+      This is conservative — assumes the intraday Low printed before the High.
+      The stoploss_triggered flag is True for any trade that exited via SL.
     """
     df = df.copy().dropna()
     n  = len(df)
@@ -1228,6 +1361,7 @@ def _duration_backtest_ticker(
             "trades": [],
             "summary": {
                 "total_trades": 0, "wins": 0, "losses": 0, "timeouts": 0,
+                "stoploss_hits": 0,
                 "win_rate_pct": None, "avg_gain_pct": None, "avg_win_pct": None,
                 "avg_loss_pct": None, "max_win_pct": None, "max_loss_pct": None,
                 "expectancy_pct": None, "total_return_pct": None,
@@ -1302,28 +1436,42 @@ def _duration_backtest_ticker(
         for trade in open_trades:
             days_held   = i - trade["_entry_idx"]
             high_today  = float(df["High"].iloc[i])
+            low_today   = float(df["Low"].iloc[i])
             close_today = float(df["Close"].iloc[i])
 
             outcome = None
             exit_px = None
+            sl_hit_today = False
 
-            # WIN: target hit intraday
-            if high_today >= trade["target_price"]:
+            # ── STOPLOSS check (fires BEFORE WIN — conservative) ──
+            # If a stop-loss is configured for this trade and the intraday
+            # Low touches/breaches it, exit at the SL price immediately.
+            # Same-bar precedence: SL > WIN > (LOSS|TIMEOUT at max_hold_days).
+            sl_price = trade.get("stoploss_price")
+            if sl_price is not None and sl_price > 0 and low_today <= sl_price:
+                outcome = "STOPLOSS"
+                exit_px = sl_price
+                sl_hit_today = True
+            # ── WIN: target hit intraday ──
+            elif high_today >= trade["target_price"]:
                 outcome = "WIN"
                 exit_px = trade["target_price"]
-            # Force exit at max_hold_days OR at last bar of data
+            # ── Force exit at max_hold_days OR at last bar of data ──
             elif days_held >= max_hold_days or i >= n - 1:
                 outcome = "LOSS" if close_today < trade["entry_price"] else "TIMEOUT"
                 exit_px = close_today
 
             if outcome:
                 gain_pct = round((exit_px - trade["entry_price"]) / trade["entry_price"] * 100, 2)
-                trade["exit_date"]  = _date(i)
-                trade["exit_price"] = round(exit_px, 2)
-                trade["days_held"]  = days_held
-                trade["gain_pct"]   = gain_pct
-                trade["outcome"]    = outcome
-                trade["is_win"]     = outcome == "WIN"
+                trade["exit_date"]            = _date(i)
+                trade["exit_price"]           = round(exit_px, 2)
+                trade["days_held"]            = days_held
+                trade["gain_pct"]             = gain_pct
+                trade["outcome"]              = outcome
+                trade["is_win"]               = outcome == "WIN"
+                # ── Stop-loss bookkeeping (v3.4) ──
+                trade["stoploss_triggered"]   = bool(sl_hit_today)
+                trade["stoploss_hit_date"]    = _date(i) if sl_hit_today else None
                 # Remove the internal _entry_idx before appending
                 del trade["_entry_idx"]
                 trades.append(trade)
@@ -1380,6 +1528,14 @@ def _duration_backtest_ticker(
                     if resistance_dist_pct <= resistance_threshold_pct:
                         is_near_resistance = True
 
+        # ── Compute stop-loss price for this trade (v3.4) ──
+        # stoploss_pct == 0 → SL disabled, stoploss_price = None
+        # (the exit-check loop skips the SL branch when stoploss_price is None.)
+        if stoploss_pct > 0:
+            trade_stoploss_price = round(curr_close * (1 - stoploss_pct / 100), 2)
+        else:
+            trade_stoploss_price = None
+
         new_trade = {
             "ticker":               ticker,
             "breakout_date":        breakout_date,
@@ -1392,6 +1548,11 @@ def _duration_backtest_ticker(
             "resistance_price":     resistance_price,         # N-day high above entry, or None
             "resistance_dist_pct":  resistance_dist_pct,      # % above entry, or None
             "is_near_resistance":   is_near_resistance,       # True if within threshold %
+            # Stop-loss fields (v3.4):
+            "stoploss_pct":         round(stoploss_pct, 2) if stoploss_pct > 0 else 0.0,
+            "stoploss_price":       trade_stoploss_price,
+            "stoploss_triggered":   False,   # filled when trade closes
+            "stoploss_hit_date":    None,    # filled when trade closes
             # Exit fields filled when trade closes:
             "exit_date":     None,
             "exit_price":    None,
@@ -1411,6 +1572,7 @@ def _duration_backtest_ticker(
             "trades":   [],
             "summary": {
                 "total_trades": 0, "wins": 0, "losses": 0, "timeouts": 0,
+                "stoploss_hits": 0,
                 "win_rate_pct": None, "avg_gain_pct": None, "avg_win_pct": None,
                 "avg_loss_pct": None, "max_win_pct": None, "max_loss_pct": None,
                 "expectancy_pct": None, "total_return_pct": None,
@@ -1420,6 +1582,7 @@ def _duration_backtest_ticker(
     wins     = [t for t in trades if t["outcome"] == "WIN"]
     losses   = [t for t in trades if t["outcome"] == "LOSS"]
     timeouts = [t for t in trades if t["outcome"] == "TIMEOUT"]
+    sl_hits  = [t for t in trades if t.get("stoploss_triggered") is True]
 
     gains     = [t["gain_pct"] for t in trades]
     win_gains = [t["gain_pct"] for t in wins]
@@ -1455,6 +1618,7 @@ def _duration_backtest_ticker(
             "wins":             len(wins),
             "losses":           len(losses),
             "timeouts":         len(timeouts),
+            "stoploss_hits":    len(sl_hits),
             "win_rate_pct":     win_rate,
             "avg_gain_pct":     avg_gain,
             "avg_win_pct":      avg_win,
@@ -1474,6 +1638,7 @@ class Ema9BacktestRequest(BaseModel):
     max_hold_days:   int   = 15
     require_uptrend: bool  = True
     fetch_fv:        bool  = False   # If True, enrich each ticker trade with Fair Value data
+    stoploss_pct:    float = 0.0     # If > 0, trades exit at entry × (1 - stoploss_pct/100)
 
 
 # ─── Backtest Route ───────────────────────────────────────────
@@ -1517,6 +1682,7 @@ async def ema9_backtest(req: Ema9BacktestRequest):
                 target_pct      = req.target_pct,
                 max_hold_days   = req.max_hold_days,
                 require_uptrend = req.require_uptrend,
+                stoploss_pct    = req.stoploss_pct,
             )
             if bt["status"] == "NO_DATA":
                 failed.append({"ticker": ticker, "error": bt.get("error", "NO_DATA")})
@@ -1551,8 +1717,10 @@ async def ema9_backtest(req: Ema9BacktestRequest):
             cur_price = float(df_ref["Close"].iloc[-1]) if df_ref is not None else None
             fv_tasks.append((bt_result, ticker, cur_price))
 
-        # Keep LOW: sma_router calls screener.in which has strict limits (~30 req/min).
-        # At concurrency=4 with ~2.7s per request, we do ~90 req/min which is safe.
+        # screener.in rate-limit: capped at 20 req/min by _screener_limiter.
+        # We keep FV_CONCURRENCY=4 so 4 calls can be IN-FLIGHT at once, but the
+        # global rate limiter guarantees the AGGREGATE rate stays under 20/min.
+        # This avoids HTTP 429 ("Too Many Requests") from screener.in.
         FV_CONCURRENCY = 4
         _fv_semaphore = asyncio.Semaphore(FV_CONCURRENCY)
 
@@ -1567,9 +1735,12 @@ async def ema9_backtest(req: Ema9BacktestRequest):
                                   time.time() - fv_fail_entry["ts"] <= FV_FAILURE_CACHE_TTL_SEC)
 
             if was_cached:
+                # Cache hit — no screener.in call, no rate-limit token needed.
                 fv = await asyncio.to_thread(_enrich_fair_value, ticker, cur_price)
             else:
+                # Cache miss — real screener.in call. Throttle to 20 req/min.
                 async with _fv_semaphore:
+                    await _screener_limiter.acquire_async()
                     fv = await asyncio.to_thread(_enrich_fair_value, ticker, cur_price)
 
             for k in _SAFE_FV_KEYS:
@@ -1695,6 +1866,7 @@ async def ema9_backtest(req: Ema9BacktestRequest):
             "max_hold_days":   req.max_hold_days,
             "require_uptrend": req.require_uptrend,
             "fetch_fv":        req.fetch_fv,
+            "stoploss_pct":    req.stoploss_pct,
         },
     })
 
@@ -1718,6 +1890,7 @@ class Ema9DurationBacktestRequest(BaseModel):
     resistance_lookback_days: int = 20   # N-day high before breakout = overhead resistance
     filter_near_resistance:  bool = False  # If True, exclude trades within 3% of resistance
     resistance_threshold_pct: float = 3.0  # "Near resistance" = within this % of the N-day high
+    stoploss_pct:    float = 0.0     # If > 0, trades exit at entry × (1 - stoploss_pct/100) when intraday Low hits SL
 
 
 @router.post("/api/ema9/duration-backtest")
@@ -1786,6 +1959,7 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
                 end_date        = end_date,
                 resistance_lookback_days  = req.resistance_lookback_days,
                 resistance_threshold_pct  = req.resistance_threshold_pct,
+                stoploss_pct    = req.stoploss_pct,
             )
             if bt["status"] == "NO_DATA":
                 failed.append({"ticker": ticker, "error": bt.get("error", "NO_DATA")})
@@ -1823,9 +1997,9 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
             cur_price = float(df_ref["Close"].iloc[-1]) if df_ref is not None else None
             fv_tasks.append((bt_result, ticker, cur_price))
 
-        # Semaphore to limit concurrent sma_router calls (avoids rate limiting)
-        # Keep LOW: sma_router calls screener.in which has strict limits (~30 req/min).
-        # At concurrency=4 with ~2.7s per request, we do ~90 req/min which is safe.
+        # screener.in rate-limit: capped at 20 req/min by _screener_limiter.
+        # FV_CONCURRENCY=4 allows 4 in-flight calls, but the global limiter
+        # guarantees the aggregate rate stays under 20 req/min (avoids 429).
         FV_CONCURRENCY = 4
 
         async def _fetch_one_fv(bt_result, ticker, cur_price):
@@ -1844,8 +2018,10 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
             if was_cached:
                 fv = await asyncio.to_thread(_enrich_fair_value, ticker, cur_price)
             else:
-                # Real sma_router call — acquire semaphore to limit concurrency
+                # Real sma_router call — acquire semaphore (concurrency cap)
+                # AND rate-limiter (20 req/min cap) before calling screener.in
                 async with _fv_semaphore:
+                    await _screener_limiter.acquire_async()
                     fv = await asyncio.to_thread(_enrich_fair_value, ticker, cur_price)
 
             # Annotate the ticker-level result with FV summary
@@ -2109,6 +2285,7 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
             "resistance_lookback_days":  req.resistance_lookback_days,
             "filter_near_resistance":    req.filter_near_resistance,
             "resistance_threshold_pct":  req.resistance_threshold_pct,
+            "stoploss_pct":    req.stoploss_pct,
         },
     })
 
@@ -2228,7 +2405,17 @@ def _recompute_summary(trades: List[Dict], target_pct: float) -> Dict:
 async def ema9_cache_stats():
     """Return cache statistics: hit/miss counts, entries, size, TTLs, disk status.
     Useful for verifying the cache is working and diagnosing performance."""
-    return _json_safe(_cache_stats_snapshot())
+    stats = _cache_stats_snapshot()
+    # Also expose the screener.in rate-limiter state (20 req/min window).
+    stats["screener_rate_limiter"] = _screener_limiter.stats()
+    return _json_safe(stats)
+
+
+@router.get("/api/ema9/screener-limiter/stats")
+async def ema9_screener_limiter_stats():
+    """Return live stats for the screener.in rate limiter (20 req/min cap).
+    Useful for verifying throttling is active and diagnosing 429 errors."""
+    return _json_safe(_screener_limiter.stats())
 
 
 @router.post("/api/ema9/cache/clear")
@@ -2417,11 +2604,6 @@ class Ema9ScreenRequest(BaseModel):
     max_candles_ago:       int  = 10
     require_uptrend:       bool = True
     allow_sideways:        bool = False
-    # Optional per-request override of the Prime FV Gap tolerance.
-    # If null/omitted, the backend falls back to config.json's
-    # "ema9_prime_fv_gap_pct" (set via the UI input box → PUT /api/config).
-    # Pass 0.0 to force strict undervalued-only for this one request.
-    prime_fv_gap_pct:      Optional[float] = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2463,91 +2645,12 @@ async def _log_signals_to_gsheet(signals: list, prime_targets: list):
         logger.warning(f"[GSheet] Logging failed (non-blocking): {e}")
 
 
-# ─────────────────────────────────────────────────────────────
-#  Prime Target FV Gap Tolerance — config reader
-# ─────────────────────────────────────────────────────────────
-# Reads the user-configurable threshold from main.py's config.json.
-# The threshold relaxes the "Prime Target" classification: by default a
-# ticker must be strictly undervalued (current_price < fair_value, i.e.
-# gap_to_fair_pct > 0). With a non-zero threshold N, a ticker is also
-# classified as Prime if it is up to N% overvalued (gap_to_fair_pct >= -N).
-#
-# Config key: "ema9_prime_fv_gap_pct" (float, default 0.0)
-# Set via: PUT /api/config  body: {"ema9_prime_fv_gap_pct": 10.0}
-#
-# This is read on EVERY call to _run_screen_pipeline + ema9_quick_scan
-# so changes take effect immediately without a server restart. The
-# Chartink watcher (which calls _run_screen_pipeline without explicitly
-# passing prime_fv_gap_pct) inherits the config value automatically.
-_CONFIG_FILE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "config.json"
-)
-
-def _load_prime_fv_gap_pct_from_config() -> float:
-    """Read ema9_prime_fv_gap_pct from config.json. Returns 0.0 on any error."""
-    try:
-        if os.path.exists(_CONFIG_FILE_PATH):
-            with open(_CONFIG_FILE_PATH) as f:
-                cfg = json.load(f)
-            val = float(cfg.get("ema9_prime_fv_gap_pct", 0.0))
-            # Clamp to a sane range to prevent accidental mis-classification
-            # (e.g., user typing 1000 would put everything in Prime).
-            if val < 0:
-                return 0.0
-            if val > 50:
-                return 50.0
-            return val
-    except Exception as e:
-        logger.warning(f"[PrimeFvGap] Failed to read config.json: {e}")
-    return 0.0
-
-
-def _is_prime_target(fv: Optional[float], cp: Optional[float],
-                     threshold_pct: float) -> bool:
-    """
-    Prime classification predicate, shared by the batch + single-ticker paths.
-
-    Uses the SAME gap_to_fair_pct formula the rest of the codebase uses:
-        gap = (fair_value - current_price) / current_price * 100
-    So:
-      • gap > 0  → undervalued (FV above price)
-      • gap = 0  → fairly valued
-      • gap < 0  → overvalued (price above FV)
-
-    A ticker is Prime iff gap_to_fair_pct >= -threshold_pct.
-    This makes the user-facing threshold match their mental model exactly:
-    setting threshold = 10 means "include tickers down to −10% gap" (inclusive).
-
-    Examples:
-      threshold = 0   → gap >= 0  (undervalued OR fairly valued)
-      threshold = 10  → gap >= -10 (allow up to 10% overvalued, inclusive)
-      threshold = 50  → gap >= -50 (allow up to 50% overvalued)
-
-    Note: at threshold = 0 this is *slightly* more permissive than the original
-    `cp < fv` (which was strictly undervalued only). The difference is only the
-    rare edge case where gap == 0 exactly (price == fair_value). In practice
-    FV is rarely an exact integer match to live price, so this is negligible.
-    """
-    if not fv or not cp:
-        return False
-    try:
-        fv_f = float(fv)
-        cp_f = float(cp)
-        if cp_f <= 0:
-            return False
-        gap_pct = (fv_f - cp_f) / cp_f * 100.0
-        return gap_pct >= -float(threshold_pct)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return False
-
-
 async def _run_screen_pipeline(
     tickers: List[str],
     interval: str = "1d",
     lookback_days: int = 180,
     max_candles_ago: int = 10,
     require_uptrend: bool = True,
-    prime_fv_gap_pct: Optional[float] = None,
 ) -> Dict:
     tickers = [
         t.strip().upper().replace(".NS", "").replace(".BO", "")
@@ -2594,8 +2697,15 @@ async def _run_screen_pipeline(
     signals.sort(key=lambda r: r.get("candles_ago", 999))
 
     # Step 3: Fair Value enrichment
+    # screener.in rate-limit: 20 req/min via _screener_limiter (token-bucket).
+    # Even though this loop is sequential, the limiter guarantees that even if
+    # multiple requests are running concurrently (e.g. multiple users hit the
+    # endpoint simultaneously), the aggregate screener.in call rate stays
+    # below 20 req/min — preventing HTTP 429 errors.
     fv_failures = []
     for i, sig in enumerate(signals):
+        # Acquire a rate-limit token before each screener.in call.
+        await _screener_limiter.acquire_async()
         fv = await asyncio.to_thread(
             _enrich_fair_value, sig["ticker"], sig.get("current_price")
         )
@@ -2605,6 +2715,8 @@ async def _run_screen_pipeline(
         if fv.get("fv_error"):
             fv_failures.append({"ticker": sig["ticker"], "fv_error": fv["fv_error"]})
 
+        # Inter-call delay (kept as a belt-and-suspenders throttle on top of
+        # the token-bucket limiter — the limiter is the real guarantee).
         if i < len(signals) - 1:
             await asyncio.sleep(FV_INTER_DELAY)
 
@@ -2612,23 +2724,14 @@ async def _run_screen_pipeline(
         logger.info(f"[FV] {len(fv_failures)}/{len(signals)} tickers had FV errors: "
                      f"{[f['ticker'] for f in fv_failures]}")
 
-    # Step 4: Partition — apply user-configured Prime FV Gap tolerance.
-    # If the caller did NOT explicitly pass a threshold, fall back to the
-    # value persisted in config.json (set via the UI input box → PUT /api/config).
-    # This lets the Chartink watcher inherit the user's global setting without
-    # needing any code changes to chartink_watcher.py.
-    if prime_fv_gap_pct is None:
-        prime_fv_gap_pct = _load_prime_fv_gap_pct_from_config()
-    logger.info(f"[PrimeFvGap] Threshold = {prime_fv_gap_pct}% "
-                f"(ticker is Prime if cp < fv * (1 + {prime_fv_gap_pct}/100))")
-
+    # Step 4: Partition
     prime_targets = []
     other_signals = []
 
     for sig in signals:
         fv = sig.get("composite_fair_price")
         cp = sig.get("current_price")
-        if _is_prime_target(fv, cp, prime_fv_gap_pct):
+        if fv and cp and cp < fv:
             prime_targets.append(sig)
         else:
             other_signals.append(sig)
@@ -2655,9 +2758,6 @@ async def _run_screen_pipeline(
         "other_count":         len(other_signals),
         "undervalued_count":   len(prime_targets),
         "interval":            interval,
-        # Echo the threshold that was actually applied so the frontend can
-        # display it in the table header (e.g., "PRIME TARGETS (FV GAP ≥ −10%)")
-        "prime_fv_gap_pct":    prime_fv_gap_pct,
     })
 
 
@@ -2741,10 +2841,6 @@ async def ema9_screen(req: Ema9ScreenRequest):
         lookback_days=req.lookback_days,
         max_candles_ago=req.max_candles_ago,
         require_uptrend=req.require_uptrend,
-        # Pass through the optional per-request override. When null (the default),
-        # _run_screen_pipeline falls back to config.json's value, which is what
-        # the UI input box updates. So most calls leave this null.
-        prime_fv_gap_pct=req.prime_fv_gap_pct,
     )
     return _json_safe(result)
 
@@ -2831,16 +2927,10 @@ async def ema9_quick_scan(ticker: str):
     if result.get("status") == "SIGNAL":
         fv_price = result.get("composite_fair_price")
         cp       = result.get("current_price")
-        # Apply the same user-configured Prime FV Gap tolerance as the batch
-        # pipeline (_run_screen_pipeline). Reads from config.json so the
-        # threshold set in the UI input box applies to Quick Scan too.
-        threshold_pct = _load_prime_fv_gap_pct_from_config()
-        if _is_prime_target(fv_price, cp, threshold_pct):
+        if fv_price and cp and cp < fv_price:
             result["signal_type"] = "PRIME"
         else:
             result["signal_type"] = "TECHNICAL_ONLY"
-        # Echo the threshold so the frontend Quick Scan card can show it.
-        result["prime_fv_gap_pct"] = threshold_pct
     elif result.get("status") == "NO_SIGNAL":
         result["signal_type"] = "NO_SIGNAL"
     else:
