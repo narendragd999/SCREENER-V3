@@ -1364,16 +1364,16 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
       </div>
     </div>
 
-    <!-- ── Score threshold selector ── -->
+    <!-- ── Score threshold / filter mode selector ── -->
     <div class="mt-4 flex items-center gap-4 flex-wrap">
-      <label class="font-ui text-xs font-600 text-slate-400 uppercase tracking-wider">Export Threshold:</label>
+      <label class="font-ui text-xs font-600 text-slate-400 uppercase tracking-wider">View &amp; Export:</label>
       <select id="fundScoreMin" onchange="loadFundamentals()"
         class="bg-card2 border border-border/50 rounded-lg px-3 py-1 font-mono text-xs text-slate-300
                focus:outline-none focus:border-accent/50">
-        <option value="4">Score ≥ 4 — 🟢 HEALTHY only (strict, ~most-safe)</option>
-        <option value="3">Score ≥ 3 — 🟢 + 🟡 (include CAUTION, broader list)</option>
-        <option value="2">Score ≥ 2 — 🟢 + 🟡 + some 🔴 (permissive)</option>
-        <option value="0">All tickers — show everything (no filter)</option>
+        <option value="4">Score ≥ 4 — 🟢 HEALTHY only (strict, safest)</option>
+        <option value="3">Score ≥ 3 — 🟢 + 🟡 (HEALTHY + CAUTION)</option>
+        <option value="2">Score ≤ 2 — 🔴 AVOID only (deteriorating fundamentals)</option>
+        <option value="all">All tickers — show everything (no filter)</option>
       </select>
       <span id="fundFilteredCount" class="font-mono text-xs text-accent"></span>
     </div>
@@ -6556,23 +6556,48 @@ function _fundScoreClass(score) {
 }
 
 /**
+ * Parse the filter-mode dropdown value and build the right query-string params.
+ * The dropdown supports 4 modes:
+ *   "4"    → HEALTHY list (score >= 4)     → "?score_min=4"
+ *   "3"    → HEALTHY+CAUTION (score >= 3)  → "?score_min=3"
+ *   "2"    → AVOID list (score <= 2)       → "?score_max=2"
+ *   "all"  → All tickers (no filter)       → ""
+ * Returns an object { params: string, label: string, mode: string } so callers
+ * can use the label for status messages and the params for fetch URLs.
+ */
+function _getFundFilterMode() {
+  const raw = document.getElementById('fundScoreMin')?.value || '4';
+  if (raw === 'all') {
+    return { params: '',                    label: 'All tickers',      mode: 'all' };
+  }
+  const n = parseInt(raw);
+  if (raw === '2') {
+    // AVOID mode — score <= 2 (deteriorating fundamentals)
+    return { params: `score_max=2`,         label: 'AVOID (score ≤ 2)', mode: 'avoid' };
+  }
+  // HEALTHY mode — score >= N
+  return { params: `score_min=${n}`,        label: `HEALTHY (score ≥ ${n})`, mode: 'healthy' };
+}
+
+/**
  * Fetch status + filter results from backend, then render the tab.
- * Called on tab open, after refresh completes, and when score_min changes.
+ * Called on tab open, after refresh completes, and when filter mode changes.
  */
 async function loadFundamentals() {
   _setFundStatus('Loading...', 'info');
   try {
-    const scoreMin = parseInt(document.getElementById('fundScoreMin')?.value || '4');
+    const fm = _getFundFilterMode();
+    const filterUrl = '/api/fundamentals/filter' + (fm.params ? '?' + fm.params : '');
     const [statusResp, filterResp] = await Promise.all([
       fetch('/api/fundamentals/status'),
-      fetch(`/api/fundamentals/filter?score_min=${scoreMin}`),
+      fetch(filterUrl),
     ]);
     if (!statusResp.ok) throw new Error(`status HTTP ${statusResp.status}`);
     if (!filterResp.ok) throw new Error(`filter HTTP ${filterResp.status}`);
     _fundData       = await statusResp.json();
     _fundFilterData = await filterResp.json();
     _renderFundamentals();
-    _setFundStatus(`Loaded ${_fundFilterData.filtered} of ${_fundData.total} tickers`, 'success');
+    _setFundStatus(`Loaded ${_fundFilterData.filtered} of ${_fundData.total} tickers — ${fm.label}`, 'success');
 
     // If cache is empty AND we're not already refreshing, auto-trigger refresh
     if (_fundData.total === 0 && !_fundRefreshing) {
@@ -6865,28 +6890,36 @@ function _setFundProgress(current, total, label) {
  * (Prime/Technical tables, Trade Log) — 100% reliable across all browsers.
  */
 async function exportFundamentalsCsv() {
-  const scoreMin = parseInt(document.getElementById('fundScoreMin')?.value || '4');
+  const fm = _getFundFilterMode();
   if (!_fundData.total) {
     _setFundStatus('No data to export — refresh first', 'danger');
     return;
   }
   if (!_fundFilterData.filtered) {
-    _setFundStatus(`No tickers match score ≥ ${scoreMin} — lower the threshold`, 'danger');
+    _setFundStatus(`No tickers match current filter (${fm.label}) — try a different mode`, 'danger');
     return;
   }
-  _setFundStatus(`Downloading CSV (score ≥ ${scoreMin}, ${_fundFilterData.filtered} tickers)...`, 'info');
+  _setFundStatus(`Downloading CSV (${fm.label}, ${_fundFilterData.filtered} tickers)...`, 'info');
 
   try {
     // Fetch the CSV as a blob — this avoids ALL Content-Disposition / browser
     // naming issues because we control the filename client-side.
-    const url = `/api/fundamentals/export?score_min=${scoreMin}`;
+    // The query params come from _getFundFilterMode() — supports both
+    // score_min=N (HEALTHY) and score_max=2 (AVOID) modes.
+    const url = '/api/fundamentals/export' + (fm.params ? '?' + fm.params : '');
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const csvText = await resp.text();
 
-    // Build a descriptive filename matching the user's tickers.csv convention
+    // Build a descriptive filename matching the user's tickers.csv convention.
+    // The backend also sets a filename via Content-Disposition, but since we're
+    // fetching as a blob we control the name client-side for reliability.
     const today = new Date().toISOString().slice(0, 10);
-    const filename = `fundamentals_filtered_score${scoreMin}_${today}.csv`;
+    let tag;
+    if (fm.mode === 'avoid')        tag = 'avoid_score_max2';
+    else if (fm.mode === 'all')     tag = 'all';
+    else                            tag = `healthy_score_min${fm.params.match(/\d+/)?.[0] || 4}`;
+    const filename = `fundamentals_${tag}_${today}.csv`;
 
     // Reuse the proven _dbtDownloadCsv helper (handles BOM + Blob + click)
     // _dbtDownloadCsv prepends its own BOM, but the backend also sends one —
@@ -6895,7 +6928,7 @@ async function exportFundamentalsCsv() {
     _dbtDownloadCsv(filename, cleanCsv);
 
     _setFundStatus(`Exported ${_fundFilterData.filtered} tickers → ${filename}. Upload to Chartink or Duration Backtest.`, 'success');
-    console.log(`[Fundamentals] Exported ${_fundFilterData.filtered} tickers → ${filename}`);
+    console.log(`[Fundamentals] Exported ${_fundFilterData.filtered} tickers (${fm.label}) → ${filename}`);
   } catch (err) {
     console.error('[Fundamentals] Export failed:', err);
     _setFundStatus(`Export failed: ${err.message}`, 'danger');

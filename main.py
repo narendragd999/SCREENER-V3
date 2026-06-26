@@ -3789,26 +3789,51 @@ async def get_fundamentals_status():
 
 
 @app.get("/api/fundamentals/filter")
-async def get_fundamentals_filter(score_min: int = 4):
+async def get_fundamentals_filter(
+    score_min: Optional[int] = None,
+    score_max: Optional[int] = None,
+):
     """
-    Return all tickers with score >= score_min from the cache.
-    Default threshold = 4 (only 🟢 HEALTHY stocks).
-    Pass score_min=3 to also include 🟡 CAUTION.
+    Return filtered tickers from the cache.
+
+    Filter modes (combinable):
+      • score_min=N     → only tickers with score >= N (HEALTHY list)
+      • score_max=N     → only tickers with score <= N (AVOID list, e.g. score_max=2)
+      • score_min=N score_max=M → range filter (N <= score <= M)
+      • neither passed  → all tickers with a valid score (excludes NO_DATA)
+
+    Default (no params) returns all tickers that have a score (0-5).
+    To include NO_DATA tickers (score=None), the frontend filters client-side
+    or a future include_no_data param can be added.
     """
-    if score_min < 0 or score_min > 5:
+    # Validate ranges
+    if score_min is not None and (score_min < 0 or score_min > 5):
         raise HTTPException(400, "score_min must be between 0 and 5")
+    if score_max is not None and (score_max < 0 or score_max > 5):
+        raise HTTPException(400, "score_max must be between 0 and 5")
+    if score_min is not None and score_max is not None and score_min > score_max:
+        raise HTTPException(400, "score_min cannot be greater than score_max")
+
     cache   = load_fundamentals()
     results = cache.get("results", []) if isinstance(cache, dict) else []
-    filtered = [r for r in results
-                if r.get("score") is not None and r.get("score", 0) >= score_min]
-    # ── Critical: sanitize ALL NaN values before returning. yfinance frequently
-    # returns float('nan') for missing metrics (ROE, OCF, etc.), and FastAPI's
-    # JSONResponse uses allow_nan=False which crashes the endpoint with:
-    #   ValueError: Out of range float values are not JSON compliant: nan
-    # _sanitize_nan recursively converts NaN/Infinity → None (JSON null).
+
+    filtered = []
+    for r in results:
+        score = r.get("score")
+        # Skip NO_DATA tickers (score is None) unless no filter is applied
+        if score is None:
+            continue
+        if score_min is not None and score < score_min:
+            continue
+        if score_max is not None and score > score_max:
+            continue
+        filtered.append(r)
+
+    # ── Critical: sanitize ALL NaN values before returning.
     return _sanitize_nan({
         "last_run_at": cache.get("last_run_at") if isinstance(cache, dict) else None,
         "score_min":   score_min,
+        "score_max":   score_max,
         "filtered":    len(filtered),
         "total":       len(results),
         "results":     filtered,
@@ -3834,36 +3859,72 @@ async def refresh_fundamentals(background_tasks: BackgroundTasks):
 
 
 @app.get("/api/fundamentals/export")
-async def export_fundamentals_csv(score_min: int = 4):
+async def export_fundamentals_csv(
+    score_min: Optional[int] = None,
+    score_max: Optional[int] = None,
+):
     """
     Export filtered tickers as CSV in the user's 3-column format:
         Sr. No.,SECURITY,SYMBOL
         1,ACC Limited,ACC
         ...
+
+    Filter modes (same as /api/fundamentals/filter):
+      • score_min=N     → HEALTHY list (score >= N)
+      • score_max=N     → AVOID list (score <= N, e.g. score_max=2)
+      • both            → range filter
+      • neither         → all tickers with a valid score
+
     The output is ready to upload to Chartink screener or Duration Backtest.
+    Filename reflects the filter mode:
+      • score_min=4  → fundamentals_healthy_score_min4_2026-06-26.csv
+      • score_max=2  → fundamentals_avoid_score_max2_2026-06-26.csv
     """
-    if score_min < 0 or score_min > 5:
+    # Validate ranges
+    if score_min is not None and (score_min < 0 or score_min > 5):
         raise HTTPException(400, "score_min must be between 0 and 5")
+    if score_max is not None and (score_max < 0 or score_max > 5):
+        raise HTTPException(400, "score_max must be between 0 and 5")
+    if score_min is not None and score_max is not None and score_min > score_max:
+        raise HTTPException(400, "score_min cannot be greater than score_max")
+
     cache   = load_fundamentals()
     results = cache.get("results", []) if isinstance(cache, dict) else []
-    filtered = [r for r in results
-                if r.get("score") is not None and r.get("score", 0) >= score_min]
 
-    # Use the company name from yfinance if available (more accurate than the
-    # CSV's SECURITY column); otherwise fall back to the CSV's value.
-    # Build CSV in memory.
+    filtered = []
+    for r in results:
+        score = r.get("score")
+        if score is None:
+            continue
+        if score_min is not None and score < score_min:
+            continue
+        if score_max is not None and score > score_max:
+            continue
+        filtered.append(r)
+
+    # Build CSV in memory
     output = io.StringIO()
-    # BOM for Excel UTF-8 detection
-    output.write("\ufeff")
+    output.write("\ufeff")  # BOM for Excel UTF-8 detection
     writer = _csv_module.writer(output, lineterminator="\r\n")
     writer.writerow(["Sr. No.", "SECURITY", "SYMBOL"])
     for i, r in enumerate(filtered, 1):
         sec = (r.get("metrics", {}) or {}).get("name") or r.get("security") or r.get("symbol", "")
-        # CSV-quote if name contains a comma
         writer.writerow([i, sec, r.get("symbol", "")])
 
     csv_bytes = output.getvalue().encode("utf-8")
-    filename = f"fundamentals_filtered_score{score_min}_{datetime.now(IST).strftime('%Y-%m-%d')}.csv"
+
+    # Build descriptive filename based on filter mode
+    today_str = datetime.now(IST).strftime('%Y-%m-%d')
+    if score_min is not None and score_max is not None:
+        tag = f"range_{score_min}_to_{score_max}"
+    elif score_max is not None:
+        tag = f"avoid_score_max{score_max}"
+    elif score_min is not None:
+        tag = f"healthy_score_min{score_min}"
+    else:
+        tag = "all"
+    filename = f"fundamentals_{tag}_{today_str}.csv"
+
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
