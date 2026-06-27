@@ -1604,7 +1604,7 @@ def update_sell_zone_gates(cfg: Dict) -> int:
         confirmed, confirm_date, new_surge_high = check_ema_confirmed_after_breakdown(
             ticker, breakdown_date, cfg
         )
-        time.sleep(random.uniform(0.3, 0.6))  # throttle yfinance calls
+        time.sleep(random.uniform(1.0, 2.0))  # throttle yfinance calls — increased per user request to avoid rate-limits
 
         if confirmed:
             sig["Sell_Zone_EMA_Confirmed"]    = True
@@ -3756,9 +3756,15 @@ def _run_fundamentals_filter_job(tickers: List[Dict], job_id: str):
             "checks":   score_data["checks"],
         })
         job_progress(job_id, i + 1, total, symbol)
-        # Be polite to yfinance — small delay between requests
+        # ── Be polite to yfinance — generous delay between requests ───────────
+        # User explicitly requested MORE delay to avoid rate-limit violations.
+        # Increased from 0.2-0.4s → 1.5-3.0s. For ~200 tickers this adds ~5-10
+        # min to the refresh time (total ~10-15 min instead of ~5 min), but
+        # stays well under yfinance's ~2000 req/hour per-IP soft limit.
+        # 2 yfinance calls per ticker (info + cashflow) × 200 tickers = 400 calls,
+        # spread over ~10-15 min = ~30-40 calls/min — comfortable margin.
         if i < total - 1:
-            time.sleep(random.uniform(0.2, 0.4))
+            time.sleep(random.uniform(1.5, 3.0))
 
     save_fundamentals({
         "last_run_at":  now_ist_str(),

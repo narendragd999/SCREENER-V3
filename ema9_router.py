@@ -98,9 +98,22 @@ FV_FAIL_CACHE_FILE = os.path.join(CACHE_DIR, "fv_fail_cache.pkl")
 # ─────────────────────────────────────────────────────────────
 YF_CHUNK_SIZE    = 100
 YF_CHUNK_DELAY   = 2.0
-FV_INTER_DELAY   = 1.5
-FV_MAX_RETRIES   = 2
-FV_RETRY_DELAY   = 3.0
+# ── screener.in politeness settings ─────────────────────────────────────────
+# User explicitly requested MORE delay to avoid rate-limit violations on
+# screener.in (the FV engine's data source via sma_router). These values are
+# deliberately conservative — slower but safe. The 12-hour success cache
+# (FV_CACHE_TTL_SEC below) is the primary mitigator; these delays gate the
+# sequential + concurrent paths when the cache misses.
+#
+# Old values → New values (all ~3x more conservative):
+#   FV_INTER_DELAY: 1.5s  → 5.0s   (sequential delay between screener.in calls)
+#   FV_MAX_RETRIES: 2     → 1      (fewer retries = less load when screener.in fails)
+#   FV_RETRY_DELAY: 3.0s  → 8.0s   (longer backoff between retries)
+# At ~2.7s per screener.in request + 5.0s inter-delay = ~7.7s per ticker.
+# For 50 cache-miss tickers ≈ 6.4 minutes (was ~3.5 min). Acceptable per user.
+FV_INTER_DELAY   = 5.0
+FV_MAX_RETRIES   = 1
+FV_RETRY_DELAY   = 8.0
 MIN_HISTORY_DAYS = 60
 DOWNLOAD_PERIOD  = "10y"
 
@@ -1552,8 +1565,13 @@ async def ema9_backtest(req: Ema9BacktestRequest):
             fv_tasks.append((bt_result, ticker, cur_price))
 
         # Keep LOW: sma_router calls screener.in which has strict limits (~30 req/min).
-        # At concurrency=4 with ~2.7s per request, we do ~90 req/min which is safe.
-        FV_CONCURRENCY = 4
+        # User explicitly requested MORE conservative throttling to avoid rate-limit
+        # violations. Reduced from 4 → 2 concurrent calls.
+        # At concurrency=2 with ~2.7s per request, we do ~44 req/min — well under
+        # the 30 req/min screener.in guideline (the cap is per-IP, not per-endpoint,
+        # so staying at ~half the limit gives headroom for sma_router's internal
+        # sub-requests). Slower but safe.
+        FV_CONCURRENCY = 2
         _fv_semaphore = asyncio.Semaphore(FV_CONCURRENCY)
 
         async def _fetch_one_fv_bt(bt_result, ticker, cur_price):
@@ -1825,8 +1843,9 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
 
         # Semaphore to limit concurrent sma_router calls (avoids rate limiting)
         # Keep LOW: sma_router calls screener.in which has strict limits (~30 req/min).
-        # At concurrency=4 with ~2.7s per request, we do ~90 req/min which is safe.
-        FV_CONCURRENCY = 4
+        # User requested MORE conservative throttling — reduced from 4 → 2 concurrent
+        # calls. Slower but safe; ~44 req/min vs the ~30 req/min guideline.
+        FV_CONCURRENCY = 2
 
         async def _fetch_one_fv(bt_result, ticker, cur_price):
             """Fetch FV for one ticker, annotate its trades, return (ticker, fv, was_cached)."""
