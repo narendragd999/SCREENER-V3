@@ -2385,6 +2385,8 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
               <th class="px-4 py-3">Target ₹</th>
               <th class="px-4 py-3">Exit Date</th>
               <th class="px-4 py-3">Exit ₹</th>
+              <th class="px-4 py-3" title="Peak High AFTER the 3% target was achieved, tracked until the 9EMA broke down (Close < EMA9 = momentum broken). This shows the maximum price you could have captured if you held with a 9EMA trailing stop instead of exiting at the fixed 3% target. Only available for WIN trades (where target was hit). LOSS/TIMEOUT trades show '—' because target was never reached.">Peak High ₹</th>
+              <th class="px-4 py-3" title="Trading days from ENTRY until the day the Peak High occurred. Compare with Days Held to see if holding longer (with a 9EMA trailing stop) would have captured more upside.">Days to Peak</th>
               <th class="px-4 py-3">Days</th>
               <th class="px-4 py-3">Gain %</th>
               <th class="px-4 py-3">Outcome</th>
@@ -5772,7 +5774,8 @@ function dbtRenderTradesTable() {
     : `${trades.length} trade(s)`;
   document.getElementById('dbtTradeCount').textContent = countLabel;
   if (trades.length === 0) {
-    const colspan = 14;
+    // Bumped from 14 → 16 to account for the new Peak High + Days to Peak columns
+    const colspan = 16;
     tbody.innerHTML = `<tr><td colspan="${colspan}" class="px-4 py-8 text-center text-slate-500 font-mono text-sm">No trades in this date range.</td></tr>`;
     return;
   }
@@ -5838,6 +5841,8 @@ function dbtRenderTradesTable() {
         <td class="px-4 py-3 font-mono text-sm text-slate-400">₹${t.target_price}</td>
         <td class="px-4 py-3 font-mono text-xs text-slate-300">${t.exit_date}</td>
         <td class="px-4 py-3 font-mono text-sm text-slate-300">₹${t.exit_price}</td>
+        <td class="px-4 py-3 font-mono text-sm ${t.peak_high != null && t.peak_high > t.target_price ? 'text-warn font-700' : 'text-slate-300'}" title="Peak High after target hit, until 9EMA broke down. ${t.peak_gain_pct != null ? 'Peak gain from entry: ' + (t.peak_gain_pct >= 0 ? '+' : '') + t.peak_gain_pct + '%' : 'Target was never hit (LOSS/TIMEOUT) — no post-target peak.'}">${t.peak_high != null ? '₹' + t.peak_high : '—'}</td>
+        <td class="px-4 py-3 font-mono text-xs ${t.days_to_peak != null && t.days_held != null && t.days_to_peak < t.days_held ? 'text-accent' : 'text-slate-400'}" title="Trading days from entry to the day of Peak High">${t.days_to_peak != null ? t.days_to_peak : '—'}</td>
         <td class="px-4 py-3 font-mono text-xs text-slate-400">${t.days_held}</td>
         <td class="px-4 py-3 font-mono text-sm ${gainClass}">${t.gain_pct >= 0 ? '+' : ''}${t.gain_pct}%</td>
         <td class="px-4 py-3 font-mono text-xs font-700 ${outcomeClass}">${t.outcome}</td>
@@ -7120,8 +7125,9 @@ function dbtExportTradesCsv() {
       'Ticker', 'Breakout Date', 'Entry Date', 'Entry Price', 'Fair Value',
       'Is Undervalued (Prime)', 'FV Gap %',
       'Resistance Price', 'Resistance Dist %', 'Is Near Resistance',
-      'Target Price', 'Exit Date', 'Exit Price', 'Days Held', 'Gain %',
-      'Outcome', 'Trend Regime'
+      'Target Price', 'Exit Date', 'Exit Price',
+      'Peak High (Post-Target to 9EMA Break)', 'Days to Peak (from Entry)', 'Peak Gain %',
+      'Days Held', 'Gain %', 'Outcome', 'Trend Regime'
     ];
     const rows = [header];
     for (const t of trades) {
@@ -7139,6 +7145,9 @@ function dbtExportTradesCsv() {
         t.target_price,
         t.exit_date || '',
         t.exit_price != null ? t.exit_price : '',
+        t.peak_high != null ? t.peak_high : '',            // ← NEW
+        t.days_to_peak != null ? t.days_to_peak : '',      // ← NEW
+        t.peak_gain_pct != null ? t.peak_gain_pct : '',    // ← NEW
         t.days_held != null ? t.days_held : '',
         t.gain_pct != null ? t.gain_pct : '',
         t.outcome || '',
@@ -7300,8 +7309,9 @@ function dbtExportFullReportCsv() {
   sections.push(['Ticker', 'Breakout Date', 'Entry Date', 'Entry Price', 'Fair Value',
                  'Is Undervalued (Prime)', 'FV Gap %',
                  'Resistance Price', 'Resistance Dist %', 'Is Near Resistance',
-                 'Target Price', 'Exit Date', 'Exit Price', 'Days Held', 'Gain %',
-                 'Outcome', 'Trend Regime']);
+                 'Target Price', 'Exit Date', 'Exit Price',
+                 'Peak High (Post-Target to 9EMA Break)', 'Days to Peak (from Entry)', 'Peak Gain %',
+                 'Days Held', 'Gain %', 'Outcome', 'Trend Regime']);
   const sortedTrades = [...(_dbtResults.all_trades || [])].sort((a, b) =>
     a.entry_date.localeCompare(b.entry_date) || a.ticker.localeCompare(b.ticker)
   );
@@ -7320,6 +7330,9 @@ function dbtExportFullReportCsv() {
       t.target_price,
       t.exit_date || '',
       t.exit_price != null ? t.exit_price : '',
+      t.peak_high != null ? t.peak_high : '',            // ← NEW
+      t.days_to_peak != null ? t.days_to_peak : '',      // ← NEW
+      t.peak_gain_pct != null ? t.peak_gain_pct : '',    // ← NEW
       t.days_held != null ? t.days_held : '',
       t.gain_pct != null ? t.gain_pct : '',
       t.outcome || '',

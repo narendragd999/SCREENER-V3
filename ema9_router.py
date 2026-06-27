@@ -1331,12 +1331,80 @@ def _duration_backtest_ticker(
 
             if outcome:
                 gain_pct = round((exit_px - trade["entry_price"]) / trade["entry_price"] * 100, 2)
-                trade["exit_date"]  = _date(i)
-                trade["exit_price"] = round(exit_px, 2)
-                trade["days_held"]  = days_held
-                trade["gain_pct"]   = gain_pct
-                trade["outcome"]    = outcome
-                trade["is_win"]     = outcome == "WIN"
+
+                # ── Peak analysis: highest High AFTER 3% target hit, UNTIL 9EMA breaks down ──
+                # User's strategy clarification:
+                #   "peak means after 3% target achieved, till 9ema not breakdown
+                #    and that peak 9ema breakdown means momentum broken so we can
+                #    cutoff trade so count peak as breakdown 9EMA line"
+                #
+                # This is a WHAT-IF analysis: "If I didn't exit at the 3% target
+                # and instead held with a 9EMA trailing stop, what would my peak
+                # have been?" The 9EMA breakdown (Close < EMA9) = momentum broken
+                # = exit signal for this hypothetical hold.
+                #
+                # Logic:
+                #   1. For WIN trades: target was hit on day i (exit day). Walk
+                #      FORWARD from day i, tracking the highest High, until Close
+                #      < EMA9 (9EMA breakdown = momentum broken) or end of data.
+                #   2. For LOSS/TIMEOUT trades: target was NEVER hit, so there's
+                #      no "post-target" period to analyze → peak = None.
+                #
+                # peak_high      = highest intraday High from target-hit day to
+                #                  9EMA breakdown day (inclusive)
+                # days_to_peak   = trading days from ENTRY to the peak day
+                #                  (so user can compare with days_held)
+                # peak_gain_pct  = % gain from entry to peak (compare with target_pct)
+                #
+                # df["ema9"] is already computed at line 1251 (before the main loop).
+                entry_idx = trade["_entry_idx"]
+                try:
+                    if outcome == "WIN":
+                        # Target was hit on day i — start tracking from here
+                        target_hit_idx = i
+                        peak_high = float(df["High"].iloc[target_hit_idx])
+                        peak_idx  = target_hit_idx
+
+                        # Walk FORWARD beyond the actual exit day, tracking
+                        # highest High until 9EMA breaks down (Close < EMA9).
+                        # This uses FUTURE data after the trade would have
+                        # closed — that's intentional for the what-if analysis.
+                        for j in range(target_hit_idx + 1, n):
+                            high_j = float(df["High"].iloc[j])
+                            if high_j > peak_high:
+                                peak_high = high_j
+                                peak_idx  = j
+                            # 9EMA breakdown check: Close < EMA9 → momentum broken
+                            close_j = float(df["Close"].iloc[j])
+                            ema9_j  = float(df["ema9"].iloc[j])
+                            if close_j < ema9_j:
+                                break  # Momentum broken — stop tracking
+
+                        days_to_peak  = peak_idx - entry_idx   # from ENTRY to peak
+                        peak_gain_pct = round(
+                            (peak_high - trade["entry_price"]) / trade["entry_price"] * 100, 2
+                        )
+                    else:
+                        # LOSS / TIMEOUT: target never hit → no post-target peak
+                        peak_high     = None
+                        days_to_peak  = None
+                        peak_gain_pct = None
+                except Exception as _e_peak:
+                    # Defensive: never let peak computation break the trade log
+                    logger.warning(f"[Duration-BT] {ticker} peak-high computation failed: {_e_peak}")
+                    peak_high     = None
+                    days_to_peak  = None
+                    peak_gain_pct = None
+
+                trade["exit_date"]      = _date(i)
+                trade["exit_price"]     = round(exit_px, 2)
+                trade["days_held"]      = days_held
+                trade["gain_pct"]       = gain_pct
+                trade["outcome"]        = outcome
+                trade["is_win"]         = outcome == "WIN"
+                trade["peak_high"]      = round(peak_high, 2) if peak_high is not None else None
+                trade["days_to_peak"]   = days_to_peak
+                trade["peak_gain_pct"]  = peak_gain_pct
                 # Remove the internal _entry_idx before appending
                 del trade["_entry_idx"]
                 trades.append(trade)
@@ -1412,6 +1480,13 @@ def _duration_backtest_ticker(
             "gain_pct":      None,
             "outcome":       None,
             "is_win":        False,
+            # Peak-during-holding analysis (filled at exit; None until then):
+            # peak_high      = highest intraday High from entry to exit (₹)
+            # days_to_peak   = trading days from entry until the peak day
+            # peak_gain_pct  = % gain from entry to peak (compare with target_pct)
+            "peak_high":     None,
+            "days_to_peak":  None,
+            "peak_gain_pct": None,
         }
         open_trades.append(new_trade)
         # NOTE: No "if in_trade: continue" here — ALL signals become trades.
